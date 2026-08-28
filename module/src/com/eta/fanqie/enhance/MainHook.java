@@ -1165,14 +1165,23 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (c instanceof TextView) {
                     CharSequence cs = ((TextView) c).getText();
                     String ts = cs == null ? "" : cs.toString().trim();
-                    coinText = ts.contains("金币") || ts.contains("领取") || ts.contains("广告");
+                    coinText = ts.contains("金币") || ts.contains("领取") || ts.contains("广告")
+                            || ts.contains("赚") || ts.matches(".*\d+金币.*");
                 }
-                boolean topRight = top >= 0 && top < screenH * 0.18f
-                        && (left + w) > screenW * 0.52f
-                        && w >= 120 && w <= screenW * 0.45f
-                        && h >= 40 && h <= screenH * 0.08f
-                        && (coinText || ((c.isClickable() || c.hasOnClickListeners()) && !(c instanceof TextView)));
-                if (topRight) {
+                // 宽松条件：位于屏幕上部 20% 且右侧超过 50% 屏宽
+                boolean topRight = top >= 0 && top < screenH * 0.20f
+                        && (left + w) > screenW * 0.50f
+                        && w >= 60 && w <= screenW * 0.50f
+                        && h >= 30 && h <= screenH * 0.15f;
+                if (!topRight) {
+                    // 递归检查子 View
+                    if (c instanceof ViewGroup) scanTopRight((ViewGroup) c, cnt, screenW, screenH, act);
+                    continue;
+                }
+                // 匹配：含金币文本，或非 TextView 的可点击/有监听器的 View（排除导航栏）
+                boolean isCoin = coinText
+                        || ((c.isClickable() || c.hasOnClickListeners()) && !(c instanceof TextView));
+                if (isCoin) {
                     hideTopRightWidget(c, coinText ? "金币入口" : c.getClass().getSimpleName(), cnt, act);
                     return;
                 }
