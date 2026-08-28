@@ -60,6 +60,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private long lastReportLog = 0;
     private final Set<String> clickedSkip = new HashSet<>();
     private long lastSkipClick = 0;
+    // 性能缓存
+    private boolean vipPatched = false;              // patchVip 成功后不再重复反射
+    private Object cachedWmgInstance = null;          // WindowManagerGlobal 单例缓存
+    private Field cachedMViewsField = null;           // mViews 字段缓存
+    private long lastHideAllTime = 0;                 // hideAll 上次执行时间
+    private static final long MIN_HIDE_INTERVAL = 500; // hideAll 最小间隔 500ms
+    private boolean hasListenerAttached = false;      // 防止重复注册 OnGlobalLayout
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -147,8 +154,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     patchTries = 0;
                     removeAdShortcuts((Activity) act);
                     h.postDelayed(new Runnable() { public void run() { patchVip(); } }, 100);
-                    h.postDelayed(new Runnable() { public void run() { patchVip(); } }, 600);
-                    h.postDelayed(new Runnable() { public void run() { patchVip(); } }, 1500);
                     startHideWatch((Activity) act, h);
                     long nowR = System.currentTimeMillis();
                     if (adHookReport.length() > 0 && nowR - lastReportLog > 60000) {
@@ -163,43 +168,43 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 首轮120ms + 前30秒高频轮询(300ms)之后1.5s + OnGlobalLayout(限频120ms) */
+    /** 优化版：首轮150ms延迟 + OnGlobalLayout(限频400ms)驱动，去掉300ms高频轮询 */
     private void startHideWatch(final Activity act, final Handler h) {
         final WeakReference<Activity> wref = new WeakReference<>(act);
+        // 首轮延迟一次扫描（等布局完成）
         h.postDelayed(new Runnable() {
             public void run() {
                 Activity a = wref.get();
-                if (a != null) { try { hideAll(a); } catch (Throwable ignored) {} }
+                if (a != null && !a.isFinishing()) { try { hideAll(a); } catch (Throwable ignored) {} }
             }
-        }, 120);
-        final long t0 = System.currentTimeMillis();
-        h.postDelayed(new Runnable() {
-            public void run() {
-                Activity a = wref.get();
-                if (a == null || a.isFinishing()) return;
-                try { hideAll(a); } catch (Throwable ignored) {}
-                h.postDelayed(this, (System.currentTimeMillis() - t0) < 30000 ? 300 : 1500);
-            }
-        }, 300);
-        try {
-            final View decor = act.getWindow().getDecorView();
-            final WeakReference<Activity> ref = new WeakReference<>(act);
-            decor.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
-                private long last = 0;
-                @Override
-                public void onGlobalLayout() {
-                    Activity a = ref.get();
-                    if (a == null) return;
-                    long now = System.currentTimeMillis();
-                    if (now - last < 120) return;
-                    last = now;
-                    hideAll(a);
-                }
-            });
-        } catch (Throwable ignored) {}
+        }, 150);
+        // 仅在首次注册 OnGlobalLayout；后续布局变化由 listener 驱动，不再轮询
+        if (!hasListenerAttached) {
+            try {
+                final View decor = act.getWindow().getDecorView();
+                final WeakReference<Activity> ref = new WeakReference<>(act);
+                decor.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+                    private long last = 0;
+                    @Override
+                    public void onGlobalLayout() {
+                        Activity a = ref.get();
+                        if (a == null || a.isFinishing()) return;
+                        long now = System.currentTimeMillis();
+                        if (now - last < 400) return;  // 400ms 限频（原120ms太频繁）
+                        last = now;
+                        hideAll(a);
+                    }
+                });
+                hasListenerAttached = true;
+            } catch (Throwable ignored) {}
+        }
     }
 
     private int hideAll(Activity act) {
+        // 限频：两次 hideAll 至少间隔 500ms，避免 OnGlobalLayout + 首屏扫描叠加
+        long now = System.currentTimeMillis();
+        if (now - lastHideAllTime < MIN_HIDE_INTERVAL) return 0;
+        lastHideAllTime = now;
         int[] cnt = {0};
         if (readerAct != act) { readerAct = act; readerPage = 0; }
         try {
@@ -232,8 +237,12 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {}
     }
 
-    /** 检测全屏覆盖广告：任何覆盖 MV 区域的大面积可点击 View（排除已知 UI） */
+    /** 检测全屏覆盖广告：仅在听歌页/播放页执行，跳过其他页面减少开销 */
     private void detectOverlayAds(Activity act, int[] cnt) {
+        String actName = act.getClass().getName();
+        // 只在听歌相关页面检测，首页/我的/阅读页不需要
+        if (!actName.contains("MainFragmentActivity") && !actName.contains("AudioPlay")
+                && !actName.contains("MusicPlayer")) return;
         View decor = act.getWindow().getDecorView();
         int sw = decor.getWidth(), sh = decor.getHeight();
         if (sw <= 0 || sh <= 0) return;
@@ -333,13 +342,16 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {}
     }
 
-    /** 扫描进程内所有窗口根View（覆盖悬浮窗/额外 window 里的领金币入口） */
+    /** 扫描进程内所有窗口根View（覆盖悬浮窗/额外 window 里的领金币入口）；反射结果已缓存 */
     private void scanAllWindows(Activity act, int[] cnt) throws Exception {
-        Class<?> wmg = Class.forName("android.view.WindowManagerGlobal");
-        Object inst = wmg.getMethod("getInstance").invoke(null);
-        Field f = wmg.getDeclaredField("mViews");
-        f.setAccessible(true);
-        Object o = f.get(inst);
+        // 首次调用时缓存 WindowManagerGlobal 单例和 mViews 字段，避免每次反射
+        if (cachedWmgInstance == null) {
+            Class<?> wmg = Class.forName("android.view.WindowManagerGlobal");
+            cachedWmgInstance = wmg.getMethod("getInstance").invoke(null);
+            cachedMViewsField = wmg.getDeclaredField("mViews");
+            cachedMViewsField.setAccessible(true);
+        }
+        Object o = cachedMViewsField.get(cachedWmgInstance);
         if (!(o instanceof java.util.List)) return;
         java.util.List<?> list = (java.util.List<?>) o;
         for (int i = 0; i < list.size(); i++) {
@@ -355,7 +367,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void scanAll(View v, int depth, int[] cnt, Activity act) {
-        if (v == null || depth > 40) return;
+        if (v == null || depth > 25) return;
         if (coinEntryId == -1 && act != null) {
             try { coinEntryId = act.getResources().getIdentifier("h80", "id", act.getPackageName()); }
             catch (Throwable t) { coinEntryId = 0; }
@@ -704,6 +716,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void patchVip() {
         if (appCl == null) return;
+        if (vipPatched) return;  // 成功过一次就不重复反射
         try {
             Class<?> acct = Class.forName("com.dragon.read.user.AcctManager", true, appCl);
             Field instF = acct.getDeclaredField("INSTANCE");
@@ -721,7 +734,8 @@ public class MainHook implements IXposedHookLoadPackage {
             trySetField(model, "reverseVIP", true);
             trySetField(model, "freeAdLeft", 999999999L);
             trySetField(model, "freeAdExpire", 4102444800000L);
-            XposedBridge.log("[" + TAG + "] 已patch userModel isVip=true reportLen=" + adHookReport.length());
+            vipPatched = true;  // 标记成功，后续不再重复
+            XposedBridge.log("[" + TAG + "] 已patch userModel isVip=true");
         } catch (Throwable t) {
             XposedBridge.log("[" + TAG + "] patchVip 异常: " + t);
             retry();
@@ -729,9 +743,9 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void retry() {
-        if (patchTries++ < 10) {
+        if (patchTries++ < 5 && !vipPatched) {
             final Handler h = new Handler(Looper.getMainLooper());
-            h.postDelayed(new Runnable() { public void run() { patchVip(); } }, 400);
+            h.postDelayed(new Runnable() { public void run() { patchVip(); } }, 500);
         }
     }
 
