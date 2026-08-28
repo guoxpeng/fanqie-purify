@@ -162,46 +162,63 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    /** 隐藏广告文本 View：向上找到"广告卡片块"级容器（含箭头等兄弟元素）整体 GONE */
-    private void hideAdEntryView(View v, String t) {
+    /**
+     * 隐藏广告文本 View：延迟到布局完成后，向上找到"广告卡片块"级容器（含箭头等兄弟元素）整体 GONE。
+     * 不能在 setText 瞬间执行——此时 w/h 均为 0，找不到卡片容器。
+     */
+    private void hideAdEntryView(final View v, final String t) {
         try {
             if (v == null) return;
             if (v.getVisibility() == View.GONE) return;
-            View root = null;
-            int sw = 0, sh = 0;
-            try { root = v.getRootView(); sw = root.getWidth(); sh = root.getHeight(); } catch (Throwable ignored) {}
-            View target = v;
-            View cur = v;
-            int[] loc = new int[2];
-            try { cur.getLocationOnScreen(loc); } catch (Throwable ignored) {}
-            int curTop = loc[1];
-            // 向上最多 6 层：找到包含广告文本+箭头的卡片容器（宽度 <90% 屏宽、非页面级）
-            for (int i = 0; i < 6; i++) {
-                View p = (View) cur.getParent();
-                if (p == null) break;
-                int pw = p.getWidth(), ph = p.getHeight();
-                int[] ploc = new int[2];
-                try { p.getLocationOnScreen(ploc); } catch (Throwable ignored) {}
-                // 页面级容器保护：宽>=90%屏宽 且 高>=40%屏高 → 不藏，停
-                if (sw > 0 && sh > 0 && pw >= sw * 0.9f && ph >= sh * 0.4f) break;
-                // 顶部栏保护：位于屏幕上部 8% 的全宽容器（可能是顶栏）
-                if (sw > 0 && pw >= sw * 0.8f && ploc[1] < sh * 0.08f && ph < sh * 0.1f) break;
-                // 底部导航保护
-                if (sw > 0 && sh > 0 && ploc[1] >= sh * 0.85f && ph < sh * 0.1f && pw >= sw * 0.6f) break;
-                // 广告卡片块：横向紧贴文本的容器（宽 < 90% 屏宽），持续向上取最大安全层
-                if (pw < sw * 0.9f) {
-                    target = p;
-                    cur = p;
-                } else {
-                    break;
-                }
-            }
-            if (target.getVisibility() != View.GONE) {
-                target.setVisibility(View.GONE);
-                XposedBridge.log("[" + TAG + "] 文本拦截隐藏['" + t + "'] " + target.getClass().getSimpleName()
-                        + " w=" + target.getWidth() + " h=" + target.getHeight());
-            }
+            final Handler h = new Handler(Looper.getMainLooper());
+            hideAdEntryViewDelayed(v, t, h, 0);
         } catch (Throwable ignored) {}
+    }
+
+    /** 延迟隐藏广告卡片：重试直到布局完成（最多 6 次） */
+    private void hideAdEntryViewDelayed(final View v, final String t, final Handler h, final int attempt) {
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                try {
+                    if (v.getVisibility() == View.GONE) return;
+                    View root = null;
+                    int sw = 0, sh = 0;
+                    try { root = v.getRootView(); sw = root.getWidth(); sh = root.getHeight(); } catch (Throwable ignored) {}
+                    if (sw <= 0 || sh <= 0) { // 还没布局，重试
+                        if (attempt < 6) hideAdEntryViewDelayed(v, t, h, attempt + 1);
+                        return;
+                    }
+                    View target = v;
+                    View cur = v;
+                    int[] ploc = new int[2];
+                    // 向上最多 8 层：找到包含广告文本+箭头的卡片容器（宽 < 90% 屏宽、非页面级）
+                    for (int i = 0; i < 8; i++) {
+                        View p = (View) cur.getParent();
+                        if (p == null) break;
+                        int pw = p.getWidth(), ph = p.getHeight();
+                        try { p.getLocationOnScreen(ploc); } catch (Throwable ignored2) {}
+                        // 页面级容器保护：宽>=90%屏宽 且 高>=40%屏高 → 不藏，停
+                        if (sw > 0 && sh > 0 && pw >= sw * 0.9f && ph >= sh * 0.4f) break;
+                        // 顶部栏保护：位于屏幕上部 8% 的全宽扁平容器
+                        if (sw > 0 && pw >= sw * 0.8f && ploc[1] < sh * 0.08f && ph < sh * 0.1f) break;
+                        // 底部导航保护
+                        if (sw > 0 && sh > 0 && ploc[1] >= sh * 0.85f && ph < sh * 0.1f && pw >= sw * 0.6f) break;
+                        // 广告卡片块：宽 < 90% 屏宽的容器持续向上取最大安全层
+                        if (pw < sw * 0.9f) {
+                            target = p;
+                            cur = p;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (target.getVisibility() != View.GONE) {
+                        target.setVisibility(View.GONE);
+                        XposedBridge.log("[" + TAG + "] 文本拦截隐藏['" + t + "'] " + target.getClass().getSimpleName()
+                                + " w=" + target.getWidth() + " h=" + target.getHeight());
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }, 60);
     }
 
     private void hookShortcutCleaner() {
@@ -1111,9 +1128,11 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log("[" + TAG + "] ViewGroup.addView 拦截失败: " + t);
         }
-        // Hook View.setVisibility：当广告 View 被设为 VISIBLE 时立即 GONE（防止重建后闪现）
+        // Hook View.setVisibility：当广告 View 被设为 VISIBLE 时，直接移除其父容器（彻底杜绝反复重显与布局抖动）
         try {
             final Set<String> adFullNamesFinal = adFullNames;
+            // 记录已移除的父容器，避免反复 removeView 造成 layout 抖动（这正是卡顿来源）
+            final Set<Integer> removedParents = new HashSet<>();
             XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
@@ -1122,13 +1141,56 @@ public class MainHook implements IXposedHookLoadPackage {
                         View v = (View) param.thisObject;
                         String cls = v.getClass().getName();
                         if (adFullNamesFinal.contains(cls)) {
-                            param.args[0] = View.GONE;
-                            XposedBridge.log("[" + TAG + "] setVisibility拦截: " + cls + " → GONE");
+                            // 1) 先尝试整体移除：找到最近的可安全移除父容器（跳过全屏/页面级），removeView 一次到位
+                            View parent = v.getParent() instanceof View ? (View) v.getParent() : null;
+                            View removeTarget = null;
+                            if (parent != null && parent.getParent() instanceof ViewGroup) {
+                                int sw = 0, sh = 0;
+                                try { sw = parent.getRootView().getWidth(); sh = parent.getRootView().getHeight(); } catch (Throwable ignored) {}
+                                View cur = parent;
+                                View prev = v;
+                                for (int i = 0; i < 4; i++) {
+                                    if (!(cur.getParent() instanceof ViewGroup)) break;
+                                    ViewGroup gp = (ViewGroup) cur.getParent();
+                                    int pw = cur.getWidth(), ph = cur.getHeight();
+                                    // 页面级/全屏容器保护：不再向上
+                                    if (sw > 0 && sh > 0 && pw >= sw * 0.9f && ph >= sh * 0.4f) break;
+                                    // 顶部栏/底部导航保护
+                                    if (sw > 0 && pw >= sw * 0.8f && ph < sh * 0.1f) break;
+                                    prev = cur;
+                                    cur = gp;
+                                }
+                                removeTarget = prev;
+                            }
+                            if (removeTarget != null && removeTarget.getParent() instanceof ViewGroup) {
+                                final ViewGroup vg = (ViewGroup) removeTarget.getParent();
+                                final View target = removeTarget;
+                                final int key = System.identityHashCode(target);
+                                if (removedParents.add(key)) {
+                                    target.post(new Runnable() {
+                                        @Override public void run() {
+                                            try {
+                                                if (target.getParent() == vg) {
+                                                    vg.removeView(target);
+                                                    XposedBridge.log("[" + TAG + "] 已移除广告父容器: " + cls + " → removeView " + target.getClass().getSimpleName());
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                    });
+                                    param.args[0] = View.GONE;
+                                } else {
+                                    param.args[0] = View.GONE;
+                                }
+                            } else {
+                                // 2) 兜底：无父容器可移除时直接 GONE
+                                param.args[0] = View.GONE;
+                                XposedBridge.log("[" + TAG + "] setVisibility拦截(GONE): " + cls);
+                            }
                         }
                     } catch (Throwable ignored) {}
                 }
             });
-            XposedBridge.log("[" + TAG + "] View.setVisibility 拦截器已启用");
+            XposedBridge.log("[" + TAG + "] View.setVisibility 拦截器已启用（移除父容器模式）");
         } catch (Throwable t) {
             XposedBridge.log("[" + TAG + "] View.setVisibility 拦截失败: " + t);
         }
