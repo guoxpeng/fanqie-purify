@@ -47,6 +47,7 @@ public class MainHook implements IXposedHookLoadPackage {
             "com.dragon.read.admodule.adfm.ecom.EcCenterActivity",
             "com.dragon.read.admodule.adfm.unlocktime.",
             "com.dragon.read.admodule.adfm.inspire.",
+            "com.dragon.read.pages.mine.AllFunctionActivity",
     };
 
     private ClassLoader appCl;
