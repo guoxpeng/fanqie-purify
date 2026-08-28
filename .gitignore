@@ -1,3 +1,9 @@
 *.keystore
 module/out/
 module/fanqie-enhance.apk
+module/classes/
+module/stub_classes/
+.artifacts/
+.freebuff/
+MEMORY_TRAPS.md
+phone_screen.png

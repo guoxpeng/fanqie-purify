@@ -2,7 +2,7 @@
 
 一个 [Vector](https://github.com/AAswordman/Vector) / LSPosed Xposed 模块：净化番茄畅听（com.xs.fm）的使用体验——破解会员、隐藏营销入口与广告弹窗。
 
-> **当前版本：v19.2** ｜ 目标应用：番茄畅听 6.6.4.32 (versionCode 664) 实测通过 ｜ 需要 Root + Vector 或 LSPosed
+> **当前版本：v1.9.5** ｜ 目标应用：番茄畅听 6.6.7.32 (versionCode 667) 实测通过 ｜ 需要 Root + Vector 或 LSPosed
 
 ---
 
@@ -24,18 +24,24 @@
 
 ### 入口净化（隐藏）
 - 底部导航「商城」「领现金」tab（保留 首页/听歌/我的 三 tab）
-- 「我的」页：我的资产 / 金币余额(币) / 现金余额(元) / 福利面板 / 购物车 / 优惠券 / 商城入口
+- 「我的」页：我的资产 / 金币余额(币) / 现金余额(元) / 福利面板 / 购物车 / 优惠券 / 商城入口 / 借钱 / 我的公益
 - 阅读页右上角「700金币」自绘小面板（按 viewId `h80` + 位置校验隐藏）
 - 右侧悬浮「立即领取」金币球
 - 首页顶部「直播」tab
 - 章节页「看小视频免30分钟广告」提示链接、「2500金币待领取」入口
+- 听歌页「全天畅听」广告卡、「看小视频免广告」横幅
+- 听歌页 MusicAdUnlockTimeView（广告解锁倒计时条）
+- 全屏覆盖型广告自动检测与隐藏
 
 ### 弹窗拦截
 - 类名匹配：luckycat / 更新升级 / 广告弹窗
 - 内容匹配：「签到」「听歌领金币」「领取+金币」类弹窗自动关闭
 
 ### 页面拦截
-- 商城 Activity、luckycat 激励页、开屏广告、沉浸式广告、免费听广告页等启动即 finish
+- 商城 Activity、luckycat 激励页、开屏广告、沉浸式广告、免费听广告页、广告解锁页等启动即 finish
+- AdUnlockTimeDialogManager 弹窗拦截（源码级 hook）
+- 激励广告 SDK 调用拦截（showAd / preloadAd 等）
+- 广告倒计时 View 创建即 GONE（MusicAdUnlockTimeView / AdUnlockTimeFloatingView）
 
 ---
 

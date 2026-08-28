@@ -2,6 +2,35 @@
 
 所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.9.5] - 2026-08-28
+
+### 新增
+- 屏蔽「借钱」「我的公益」入口（shouldHide 文本规则）
+- 听歌页广告拦截增强：按资源 ID `a3c`/`fp_` 精确隐藏 MusicAdUnlockTimeView 和广告卡片
+- 全屏覆盖型广告自动检测与隐藏（非基础布局的大面积可点击 View）
+- 动态 View hook：发现广告 View 后自动 hook 构造函数，重建即隐藏
+- 未知可点击 View 扫描：一次性记录所有无文本可点击 View 便于发现新广告位
+
+### 适配
+- 番茄畅听 6.6.7.32 (versionCode 667)
+- 版本号改为语义化 1.9.5 (versionCode 19500)
+
+## [v20/v1.9.6 ~ v1.9.10] - 2026-08-28
+
+### 新增
+- 源码级拦截解锁时长倒计时：`AdUnlockTimeDialogManager.realShowDialog` 等弹窗入口直接短路；`MusicAdUnlockTimeView`/`AdUnlockTimeFloatingView` 构造即 GONE（听歌页倒计时条/悬浮条）
+- 右上角金币/领取/免费入口（阅读页「200金币」等）：`hideTopRightWidget` 向上找到含底色的 widget 容器整体 GONE；`scanTopRight` 放宽 TextView 候选
+- BLOCKED 新增 `EcCenterActivity`、`adfm.unlocktime.` 前缀；Dialog 文本规则增加「广告」「跳过」
+- `hookShortcutCleaner`/`removeAdShortcuts` 桌面快捷方式清理（自 v19 保留）
+
+### 修复
+- **顶部菜单标签误伤（v19 老问题）**：`hideAdCard` 曾把 AppBarLayout（含标签栏）整体 INVISIBLE。v21 加 `isProtectedContainer`（AppBar/TopView/TabLayout/主导航/RadioButton≥2）；v23 升级 `protectedWithin`（候选 3 层内含受保护容器也拒绝）；v24 广告卡候选必须 widget 级（宽度<60%屏宽）——「全天畅听」banner 只藏 142x113 药丸，顶栏无损
+- 隐藏动作加 visibility 去重，消除同目标每 300ms 重复日志（1040→1 条）
+- 本地构建链修复：stub 补 `XposedBridge.hookAllMethods`；`assets/xposed_init` 打包位置修正
+
+### 已知问题
+- 设备 PMIC 看门狗脏重启后 PM 状态可能损坏：第三方 App 解析失效/无法启动，需 `install -r` base.apk 重建 resolver；此时 Vector 守护进程可能整个开机周期不注入模块，需 PM 恢复后强停重启目标 App
+
 ## [v19.2] - 2026-08-24
 
 ### 新增
