@@ -7,20 +7,20 @@
 
 ### 新增
 - **屏蔽「借钱」「我的公益」入口**：「我的」页及各页面出现时自动隐藏（shouldHide 文本规则）
-- **听歌页广告拦截增强**：
-  - 按资源 ID `a3c` 精确隐藏 `MusicAdUnlockTimeView`（广告解锁倒计时条），同时 hook 构造函数防止重建
-  - 按资源 ID `fp_` 精确隐藏广告卡片容器
-  - 全屏覆盖型广告自动检测：非基础布局的大面积可点击 View 自动 GONE
-- **广告 SDK 源码级拦截**：hook `AdUnlockTimeDialogManager` 弹窗展示方法（realShowDialog / showDialog 等）
-- **激励广告调用拦截**：showAd / preloadAd / requestAd / loadAd 等方法短路返回
-- **广告 View 创建即隐藏**：`MusicAdUnlockTimeView` / `AdUnlockTimeFloatingView` 构造函数 hook
-- **未知可点击 View 扫描**：5 秒后一次性记录所有无文本可点击 View，便于发现新广告位
+- **听歌页广告拦截增强**：按资源 ID `a3c`/`fp_` 精确隐藏广告位 + hook 构造函数防重建
+- **DialogFragment 广告弹窗拦截（重点修复）**：
+  - APK 逆向定位：章节末「看小视频免30分钟广告」= `ReaderInspireDialogFragment`（DialogFragment，不走 `Dialog.show()`，旧逻辑全部漏掉）
+  - hook `androidx.fragment.app.DialogFragment.show()` 两个重载，类名含 ad/inspire/interrupt 关键词短路
+  - 精确 hook 4 个广告 Fragment 的 `onCreateView` 返回 null 阻止渲染：`ReaderInspireDialogFragment` / 听书 `InspireDialogFragment` / `InterruptAdReaderDialogNew` / `ReaderRuleDescriptionFragment`
+- **广告文本实时过滤**：hook `TextView.setText()` + `View.setContentDescription`，广告文本被设置的瞬间隐藏自身及卡片容器（覆盖切换智能朗读/真人讲书等模式重建场景，零扫描零延迟）
+- **`View.setVisibility` 拦截**：已知广告 View（`entranceview.h` 全天畅听 / `novelug.progress.b` 300金币）被设为 VISIBLE 时强制 GONE，防重建闪现
+- **广告 SDK 源码级拦截**：`AdUnlockTimeDialogManager` 弹窗展示方法、激励广告 showAd/preloadAd 等短路
 
-### 改进
-- 隐藏策略统一改为 GONE（不再 INVISIBLE 占位），菜单自动补位
-- `hideAdCard` 保护机制升级：`protectedWithin` 3 层深度检查防误伤顶栏
-- 广告卡候选限制为 widget 级（宽度 <60% 屏宽），「全天畅听」banner 只藏 142×113 药丸
-- 桌面快捷方式过滤新增「领红包」关键词
+### 改进（性能）
+- **移除粗暴扫描**：删除全树 View 遍历探测（scanUnknownClickables / forceScanAdText），改为源码级 hook
+- `hideAll()` 限频 1.2s、`OnGlobalLayout` 限频 1.2s，避免卡顿
+- 短类名匹配误伤修复：`"h"`/`"b"` 曾误伤阅读器渲染器 `com.dragon.reader.lib.drawlevel.view.h`（阅读页文字被隐藏），改为全限定类名匹配
+- 隐藏策略统一 GONE；`hideAdCard` 保护 `protectedWithin` 3 层防误伤顶栏
 
 ### 适配
 - 版本号改为语义化 1.9.5（versionCode 19500）

@@ -7,13 +7,18 @@
 ### 新增
 - 屏蔽「借钱」「我的公益」入口（shouldHide 文本规则）
 - 听歌页广告拦截增强：按资源 ID `a3c`/`fp_` 精确隐藏 MusicAdUnlockTimeView 和广告卡片
-- 全屏覆盖型广告自动检测与隐藏（非基础布局的大面积可点击 View）
-- 动态 View hook：发现广告 View 后自动 hook 构造函数，重建即隐藏
-- 未知可点击 View 扫描：一次性记录所有无文本可点击 View 便于发现新广告位
+- **DialogFragment 广告弹窗拦截（重点）**：APK 逆向定位章节末「看小视频免30分钟广告」= `ReaderInspireDialogFragment`（DialogFragment，不走 `Dialog.show()`）；hook `androidx.fragment.app.DialogFragment.show()` + 4 个广告 Fragment `onCreateView` 返回 null
+- **广告文本实时过滤**：hook `TextView.setText()`/`setContentDescription`，广告文本设置瞬间隐藏（覆盖模式切换重建，零扫描）
+- **`View.setVisibility` 拦截**：已知广告 View 设 VISIBLE 时强制 GONE（防重建闪现）
+
+### 改进（性能）
+- **移除粗暴扫描**：删除全树 View 遍历探测（scanUnknownClickables/forceScanAdText），改为源码级 hook
+- `hideAll()`/`OnGlobalLayout` 限频 1.2s，避免卡顿
+- **短类名匹配误伤修复**：`"h"` 误伤阅读器渲染器 `com.dragon.reader.lib.drawlevel.view.h`（阅读页文字被隐藏），改全限定类名匹配
 
 ### 适配
 - 番茄畅听 6.6.7.32 (versionCode 667)
-- 版本号改为语义化 1.9.5 (versionCode 19500)
+- 版本号语义化 1.9.5 (versionCode 19500)
 
 ## [v20/v1.9.6 ~ v1.9.10] - 2026-08-28
 

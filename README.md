@@ -36,6 +36,8 @@
 ### 弹窗拦截
 - 类名匹配：luckycat / 更新升级 / 广告弹窗
 - 内容匹配：「签到」「听歌领金币」「领取+金币」类弹窗自动关闭
+- **DialogFragment 拦截（v1.9.5 修复）**：章节末「看小视频免30分钟广告」等广告弹窗是 DialogFragment（不走 Dialog.show()），hook `androidx.fragment.app.DialogFragment.show()` + 已知广告 Fragment 的 `onCreateView` 直接阻止渲染
+- **广告文本实时过滤**：hook `TextView.setText()`，广告文本被设置的瞬间即隐藏（覆盖 App 切换智能朗读/真人讲书等模式重建 View 的场景，零扫描零卡顿）
 
 ### 页面拦截
 - 商城 Activity、luckycat 激励页、开屏广告、沉浸式广告、免费听广告页、广告解锁页等启动即 finish
@@ -78,12 +80,14 @@
 | 机制 | 说明 |
 |------|------|
 | patchVip | 反射 `com.dragon.read.user.AcctManager.INSTANCE.userModel`，写入 isVip/freeAd/expireTime 等字段 |
-| hideAll | 每 300ms 轮询 + OnGlobalLayout 监听，遍历 View 树按文本规则隐藏入口 |
+| hideAll | OnGlobalLayout 监听（1.2s 限频），遍历 View 树按文本规则隐藏入口（不做高频轮询，防卡顿） |
 | hideChain | 触底隐藏：向上连藏最多 3 层父容器，带页面级/导航栏双重保护防误伤 |
-| scanAllWindows | 反射 WindowManagerGlobal.mViews，覆盖独立悬浮窗里的金币球 |
+| scanAllWindows | 反射 WindowManagerGlobal.mViews，覆盖独立悬浮窗里的金币球（低频率） |
 | Dialog blocker | hook Dialog.show()，类名+内容双重匹配后 dismiss |
+| **DialogFragment blocker** | hook `androidx.fragment.app.DialogFragment.show()` + 广告 Fragment `onCreateView` 返回 null（精准拦截，无扫描） |
+| **TextView 文本过滤** | hook `TextView.setText()`：广告文本被设置瞬间隐藏自身及卡片容器（零扫描、零延迟、防模式切换重建） |
 
-完整源码见 [`MainHook.java`](module/src/com/eta/fanqie/enhance/MainHook.java)（约 500 行，单文件实现）。
+完整源码见 [`MainHook.java`](module/src/com/eta/fanqie/enhance/MainHook.java)（约 1500 行，单文件实现）。
 
 ---
 

@@ -34,7 +34,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "FanqieEnhance";
 
     private static final String[] BLOCKED = {
-            "com.xs.fm.live.impl.ecom.mall.NativeMallActivity",
+            // 广告SDK/页面
             "com.bytedance.ug.sdk.luckycat.",
             "com.ss.android.excitingvideo.",
             "com.dragon.read.ad.dark.ui.",
@@ -47,7 +47,21 @@ public class MainHook implements IXposedHookLoadPackage {
             "com.dragon.read.admodule.adfm.ecom.EcCenterActivity",
             "com.dragon.read.admodule.adfm.unlocktime.",
             "com.dragon.read.admodule.adfm.inspire.",
+            "com.dragon.read.admodule.",
+            // 商城/电商
+            "com.xs.fm.live.impl.ecom.mall.NativeMallActivity",
+            "com.xs.fm.live.impl.ecom.",
+            "com.dragon.read.mall.",
+            // 任务/金币/福利中心
+            "com.dragon.read.task.",
+            "com.dragon.read.coin.",
+            "com.dragon.read.welfare.",
+            "com.dragon.read.wallet.",
+            // 全部功能页（含商城/借钱/公益等入口）
             "com.dragon.read.pages.mine.AllFunctionActivity",
+            // 邀请/红包
+            "com.dragon.read.invite.",
+            "com.dragon.read.redpacket.",
     };
 
     private ClassLoader appCl;
@@ -65,7 +79,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private Object cachedWmgInstance = null;          // WindowManagerGlobal 单例缓存
     private Field cachedMViewsField = null;           // mViews 字段缓存
     private long lastHideAllTime = 0;                 // hideAll 上次执行时间
-    private static final long MIN_HIDE_INTERVAL = 500; // hideAll 最小间隔 500ms
+    private static final long MIN_HIDE_INTERVAL = 1200; // hideAll 最小间隔 1.2秒，避免卡顿
     private boolean hasListenerAttached = false;      // 防止重复注册 OnGlobalLayout
 
     @Override
@@ -79,8 +93,115 @@ public class MainHook implements IXposedHookLoadPackage {
         hookDialogBlocker();
         hookShortcutCleaner();
         hookAdSignals();
+        hookKnownAdViews();
+        hookDialogFragmentBlocker();
+        hookTextViewAdFilter();
         scheduleAdSignalRetry();
-        scheduleUnknownViewScanner();
+    }
+
+    /**
+     * 精准拦截广告文本 View：hook TextView.setText()，广告文本被设置的瞬间立即 GONE 自身及父容器。
+     * 不依赖扫描/轮询，App 任何模式切换重建 View 都会触发，零卡顿。
+     */
+    private void hookTextViewAdFilter() {
+        final XC_MethodHook setTextHook = new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    CharSequence cs = (CharSequence) param.args[0];
+                    if (cs == null) return;
+                    String t = cs.toString().trim();
+                    if (t.length() == 0 || t.length() > 14) return; // 广告入口文本短，正文长文本不动
+                    if (isAdEntryText(t)) {
+                        hideAdEntryView((View) param.thisObject, t);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        };
+        // setText(CharSequence) 与 setText(CharSequence, BufferType)
+        try { XposedHelpers.findAndHookMethod(TextView.class, "setText", CharSequence.class, setTextHook); } catch (Throwable ignored) {}
+        try { XposedHelpers.findAndHookMethod(TextView.class, "setText", CharSequence.class, "android.widget.TextView$BufferType", setTextHook); } catch (Throwable ignored) {}
+        // 内容描述也拦截（无文本仅图标的入口）
+        try {
+            XposedHelpers.findAndHookMethod(View.class, "setContentDescription", CharSequence.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        CharSequence cs = (CharSequence) param.args[0];
+                        if (cs == null) return;
+                        String t = cs.toString().trim();
+                        if (t.length() == 0 || t.length() > 14) return;
+                        if (isAdEntryText(t)) {
+                            hideAdEntryView((View) param.thisObject, t);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+        } catch (Throwable ignored) {}
+        XposedBridge.log("[" + TAG + "] TextView.set 广告文本过滤器已启用");
+    }
+
+    /** 广告入口文本关键词（精确匹配，防误伤正文） */
+    private boolean isAdEntryText(String t) {
+        if (t == null || t.length() > 14) return false;
+        // 畅听/免广告类
+        if (t.contains("全天免费畅听") || t.contains("全天畅听") || t.contains("免广告")
+                || t.contains("看小视频") || t.contains("看视频免") || t.contains("免费畅听")
+                || t.contains("免费听") || t.contains("畅听中") || t.contains("看小视频免")) return true;
+        // 金币/钱包类
+        if (t.contains("金币余额") || t.contains("现金余额") || t.contains("领金币")
+                || t.contains("逛街赚金币") || t.contains("可领") || t.contains("待领")
+                || t.contains("去领") || t.contains("金币待")) return true;
+        // 资产/会员/商城类
+        if (t.contains("我的资产") || t.contains("邀请好友") || t.contains("购物车")
+                || t.contains("优惠券") || t.contains("立即领取") || t.contains("领红包")
+                || t.contains("签到") || t.contains("商城") || t.contains("领现金")
+                || t.contains("福利") || t.contains("借钱") || t.contains("公益")
+                || t.contains("做任务") || t.contains("赚金币") || t.contains("我的收益")) return true;
+        // 激励视频/解锁类
+        if (t.contains("激励视频") || t.contains("观看视频") || t.contains("解锁时长")
+                || t.contains("可解锁")) return true;
+        return false;
+    }
+
+    /** 隐藏广告文本 View：向上找到"广告卡片块"级容器（含箭头等兄弟元素）整体 GONE */
+    private void hideAdEntryView(View v, String t) {
+        try {
+            if (v == null) return;
+            if (v.getVisibility() == View.GONE) return;
+            View root = null;
+            int sw = 0, sh = 0;
+            try { root = v.getRootView(); sw = root.getWidth(); sh = root.getHeight(); } catch (Throwable ignored) {}
+            View target = v;
+            View cur = v;
+            int[] loc = new int[2];
+            try { cur.getLocationOnScreen(loc); } catch (Throwable ignored) {}
+            int curTop = loc[1];
+            // 向上最多 6 层：找到包含广告文本+箭头的卡片容器（宽度 <90% 屏宽、非页面级）
+            for (int i = 0; i < 6; i++) {
+                View p = (View) cur.getParent();
+                if (p == null) break;
+                int pw = p.getWidth(), ph = p.getHeight();
+                int[] ploc = new int[2];
+                try { p.getLocationOnScreen(ploc); } catch (Throwable ignored) {}
+                // 页面级容器保护：宽>=90%屏宽 且 高>=40%屏高 → 不藏，停
+                if (sw > 0 && sh > 0 && pw >= sw * 0.9f && ph >= sh * 0.4f) break;
+                // 顶部栏保护：位于屏幕上部 8% 的全宽容器（可能是顶栏）
+                if (sw > 0 && pw >= sw * 0.8f && ploc[1] < sh * 0.08f && ph < sh * 0.1f) break;
+                // 底部导航保护
+                if (sw > 0 && sh > 0 && ploc[1] >= sh * 0.85f && ph < sh * 0.1f && pw >= sw * 0.6f) break;
+                // 广告卡片块：横向紧贴文本的容器（宽 < 90% 屏宽），持续向上取最大安全层
+                if (pw < sw * 0.9f) {
+                    target = p;
+                    cur = p;
+                } else {
+                    break;
+                }
+            }
+            if (target.getVisibility() != View.GONE) {
+                target.setVisibility(View.GONE);
+                XposedBridge.log("[" + TAG + "] 文本拦截隐藏['" + t + "'] " + target.getClass().getSimpleName()
+                        + " w=" + target.getWidth() + " h=" + target.getHeight());
+            }
+        } catch (Throwable ignored) {}
     }
 
     private void hookShortcutCleaner() {
@@ -190,7 +311,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         Activity a = ref.get();
                         if (a == null || a.isFinishing()) return;
                         long now = System.currentTimeMillis();
-                        if (now - last < 400) return;  // 400ms 限频（原120ms太频繁）
+                        if (now - last < 1200) return;  // 1.2秒限频，避免拖慢宿主 App
                         last = now;
                         hideAll(a);
                     }
@@ -213,6 +334,10 @@ public class MainHook implements IXposedHookLoadPackage {
             scanRadioGroup(decor, cnt);
             scanReaderTopRightCoin(decor, cnt, act);
             scanListeningPageAds(act, cnt);
+            hideKnownAdResources(act, cnt);
+            // 强制扫描：遍历所有 View，通过 toString() 匹配广告关键词（覆盖非 TextView 的自绘广告）
+            // 不做全树 forceScan：避免章节阅读时反复遍历造成卡顿；仅依赖精确资源/类名 hook
+            if (false) forceScanAdText(decor, 0, cnt, act);
         } catch (Throwable ignored) {}
         try {
             scanAllWindows(act, cnt);
@@ -220,20 +345,104 @@ public class MainHook implements IXposedHookLoadPackage {
         return cnt[0];
     }
 
-    /** 扫描听歌页：通过已知混淆广告资源 ID 精确隐藏 */
+    /** 强制扫描：通过 View.toString() 检查广告关键词，覆盖非 TextView 的自绘广告 */
+    private void forceScanAdText(View v, int depth, int[] cnt, Activity act) {
+        if (v == null || depth > 30 || v.getVisibility() != View.VISIBLE) return;
+        try {
+            String vs = v.toString();
+            if (vs.length() > 0 && vs.length() < 200) {
+                String lower = vs.toLowerCase();
+                // 直接匹配广告横幅文本（覆盖 Canvas.drawText 绘制的广告）
+                if (lower.contains("看小视频") || lower.contains("看视频免")
+                        || lower.contains("免广告阅读") || lower.contains("免广告")
+                        || lower.contains("解锁时长") || lower.contains("可解锁")
+                        || lower.contains("做任务免") || lower.contains("观看视频免")
+                        || lower.contains("激励视频") || lower.contains("再看") && lower.contains("秒")) {
+                    // 找到广告 View，向上找合理的容器隐藏
+                    View toHide = v;
+                    for (int i = 0; i < 3; i++) {
+                        View parent = (View) toHide.getParent();
+                        if (parent == null) break;
+                        int pw = parent.getWidth(), ph = parent.getHeight();
+                        int sw = act.getWindow().getDecorView().getWidth();
+                        int sh = act.getWindow().getDecorView().getHeight();
+                        if (pw >= sw * 0.9f && ph >= sh * 0.5f) break; // 页面级不停
+                        toHide = parent;
+                    }
+                    if (toHide.getVisibility() != View.GONE) {
+                        toHide.setVisibility(View.GONE);
+                        cnt[0]++;
+                        XposedBridge.log("[" + TAG + "] [forceScan] 隐藏广告: " + vs.substring(0, Math.min(60, vs.length())));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                forceScanAdText(vg.getChildAt(i), depth + 1, cnt, act);
+            }
+        }
+    }
+
+    /** 扫描听歌页全屏覆盖型广告（已知资源ID已移至 hideKnownAdResources） */
     private void scanListeningPageAds(Activity act, int[] cnt) {
         if (act == null) return;
         String actName = act.getClass().getName();
-        // 听歌页在 MainFragmentActivity，且听歌 tab 为当前页
-        if (!actName.contains("MainFragmentActivity")) return;
+        if (!actName.contains("MainFragmentActivity") && !actName.contains("AudioPlay")) return;
         try {
-            // 已知广告位资源 ID（从 ui-now.xml 分析得到）
-            // a3c: 全宽横幅 [0,1281][1080,1413]，猜你喜欢下方
-            // fp_: 卡片容器 [60,1455][1020,1581]，含 fpd
-            hideByResId(act, "a3c", cnt, "听歌页横幅广告");
-            hideByResId(act, "fp_", cnt, "听歌页卡片广告");
-            // 检测全屏覆盖型广告（覆盖 MV 的插屏/视频广告）
             detectOverlayAds(act, cnt);
+        } catch (Throwable ignored) {}
+    }
+
+    /** 通过已知资源 ID + 文本匹配 精确隐藏广告元素（全覆盖：主页/阅读页/听歌页） */
+    private void hideKnownAdResources(Activity act, int[] cnt) {
+        if (act == null) return;
+        // --- 主页顶部"全天畅听"入口 (id=gxi, 142x47 药丸) ---
+        hideByResId(act, "gxi", cnt, "全天畅听入口");
+        // --- 阅读页全天免费畅听中：资源 ID bwf（可点击容器），gtr(文本) ---
+        hideByResIdUp(act, "bwf", cnt, "全天免费畅听中", 2);
+        hideByResIdUp(act, "gtr", cnt, "全天免费畅听文本", 3);
+        // --- 阅读页300金币：资源 ID abz（ImageView），父容器 abx ---
+        hideByResIdUp(act, "abz", cnt, "300金币", 3);
+        hideByResIdUp(act, "abx", cnt, "300金币容器", 2);
+        // --- 听歌页已知广告位 ---
+        hideByResId(act, "a3c", cnt, "听歌页横幅广告");
+        hideByResId(act, "fp_", cnt, "听歌页卡片广告");
+    }
+
+    /** 通过资源 ID 找到 View 后，向上隐藏 N 层父容器 */
+    private void hideByResIdUp(Activity act, String resName, int[] cnt, String desc, int upLevels) {
+        try {
+            int resId = act.getResources().getIdentifier(resName, "id", act.getPackageName());
+            if (resId <= 0) return;
+            View target = act.getWindow().getDecorView().findViewById(resId);
+            if (target == null || target.getVisibility() == View.GONE) return;
+            // 向上找 N 层父容器来隐藏
+            View toHide = target;
+            for (int i = 0; i < upLevels; i++) {
+                View parent = (View) toHide.getParent();
+                if (parent == null) break;
+                // 不要越过页面级容器（宽>=90%屏宽且高>=70%屏高）
+                int[] loc = new int[2];
+                try { parent.getLocationOnScreen(loc); } catch (Throwable ignored2) {}
+                View decor = act.getWindow().getDecorView();
+                int sw = decor.getWidth(), sh = decor.getHeight();
+                int pw = parent.getWidth(), ph = parent.getHeight();
+                if (pw >= sw * 0.9f && ph >= sh * 0.7f) break; // 页面级，停
+                toHide = parent;
+            }
+            if (toHide.getVisibility() != View.GONE) {
+                toHide.setVisibility(View.GONE);
+                cnt[0]++;
+                int[] loc = new int[2];
+                try { target.getLocationOnScreen(loc); } catch (Throwable ignored2) {}
+                XposedBridge.log("[" + TAG + "] 已隐藏" + desc + "(id=" + resName + ") "
+                        + toHide.getClass().getName() + " w=" + toHide.getWidth() + " h=" + toHide.getHeight()
+                        + " loc=[" + loc[0] + "," + loc[1] + "]");
+                // 动态 hook 防重建
+                hookViewClass(toHide.getClass().getName());
+            }
         } catch (Throwable ignored) {}
     }
 
@@ -264,18 +473,39 @@ public class MainHook implements IXposedHookLoadPackage {
         // 这个 View 足够大（宽>=80%屏宽 且 高>=40%屏高）
         String cls = v.getClass().getName();
         // 排除已知的非广告大容器
-        if (cls.contains("RecyclerView") || cls.contains("ViewPager")
-                || cls.contains("FrameLayout") || cls.contains("LinearLayout")
-                || cls.contains("RelativeLayout") || cls.contains("ConstraintLayout")
+        boolean isBasicLayout = cls.contains("RecyclerView") || cls.contains("ViewPager")
                 || cls.contains("CoordinatorLayout") || cls.contains("DecorView")
-                || cls.contains("ContentFrameLayout") || cls.contains("BackView")) {
-            // 基础布局容器不算，继续往下找
+                || cls.contains("ContentFrameLayout") || cls.contains("BackView")
+                || cls.contains("ConstraintLayout");
+        if (isBasicLayout) {
             if (v instanceof ViewGroup) {
                 ViewGroup vg = (ViewGroup) v;
                 for (int i = 0; i < vg.getChildCount(); i++)
                     detectOverlayRecursive(vg.getChildAt(i), depth + 1, sw, sh, cnt);
             }
             return;
+        }
+        // FrameLayout/LinearLayout 等常见广告容器：检查是否含广告相关内容
+        boolean mayBeAdContainer = cls.contains("FrameLayout") || cls.contains("LinearLayout")
+                || cls.contains("RelativeLayout");
+        if (mayBeAdContainer) {
+            // 检查子节点是否有广告文本
+            boolean hasAdContent = false;
+            if (v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                for (int i = 0; i < vg.getChildCount() && !hasAdContent; i++) {
+                    hasAdContent = viewContainsAdText(vg.getChildAt(i), 0);
+                }
+            }
+            if (!hasAdContent) {
+                // 非广告容器，继续往下找
+                if (v instanceof ViewGroup) {
+                    ViewGroup vg = (ViewGroup) v;
+                    for (int i = 0; i < vg.getChildCount(); i++)
+                        detectOverlayRecursive(vg.getChildAt(i), depth + 1, sw, sh, cnt);
+                }
+                return;
+            }
         }
         // 非基础容器但很大 → 可能是广告覆盖层
         String key = "overlay_" + cls + "_" + w + "x" + h;
@@ -459,11 +689,16 @@ public class MainHook implements IXposedHookLoadPackage {
             for (int i = 0; i < rg.getChildCount(); i++) {
                 View c = rg.getChildAt(i);
                 String txt = findText(c);
-                if (txt != null && (txt.contains("商城") || txt.contains("领现金"))) {
-                    if (c.getVisibility() != View.GONE) {
-                        c.setVisibility(View.GONE);
-                        cnt[0]++;
-                        XposedBridge.log("[" + TAG + "] 已隐藏底部tab['" + txt + "'] view=" + c.getClass().getName());
+                if (txt != null) {
+                    // 仅保留核心tab：首页/听歌/我的；其余一律隐藏
+                    boolean keep = txt.equals("首页") || txt.equals("听歌") || txt.equals("我的")
+                            || txt.equals("书城") || txt.equals("音乐");
+                    if (!keep && !txt.isEmpty()) {
+                        if (c.getVisibility() != View.GONE) {
+                            c.setVisibility(View.GONE);
+                            cnt[0]++;
+                            XposedBridge.log("[" + TAG + "] 已隐藏非核心底部tab['" + txt + "'] view=" + c.getClass().getName());
+                        }
                     }
                 }
             }
@@ -493,23 +728,47 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private boolean shouldHide(String t) {
+        // 核心导航标签 —— 绝不隐藏
         if (t.equals("首页") || t.equals("听歌") || t.equals("我的")) return false;
-        if (t.contains("资产")) return true;
-        if (t.contains("购物车") || t.contains("优惠券")) return true;
-        if (t.contains("立即领取")) return true;
-        if (t.contains("直播") && t.length() <= 4) return true;
-        if (t.contains("现金") && !t.matches(".*[0-9].*")) return true;
-        if (t.contains("福利") && t.length() <= 8) return true;
-        if (t.contains("商城") || t.contains("领现金")) return true;
-        if (t.contains("游戏中心")) return true;
+        // 子分类标签 —— 不隐藏（推荐/听书/音乐/短剧/看书/漫剧/分类）
+        if (t.equals("推荐") || t.equals("听书") || t.equals("音乐") || t.equals("短剧")
+                || t.equals("看书") || t.equals("漫剧") || t.equals("分类")) return false;
+        // === 金币/赚钱类 ===
         if (t.contains("金币")) return true;
-        if (t.contains("广告") && (t.contains("免") || t.contains("看"))) return true;
+        if (t.contains("赚") && (t.contains("金币") || t.contains("钱") || t.contains("取"))) return true;
+        if (t.contains("可领") || t.contains("待领") || t.contains("去领")) return true;
+        // === 福利/红包/签到类 ===
+        if (t.contains("福利") && t.length() <= 10) return true;
+        if (t.contains("红包") || t.contains("签到") || t.contains("邀请")) return true;
+        if (t.contains("新人") || t.contains("首单")) return true;
+        // === 畅听/VIP广告 ===
         if (t.contains("全天") && t.contains("畅听")) return true;
+        if (t.contains("免费畅听") || t.contains("免费听") || t.contains("免广告")) return true;
+        if (t.contains("看小说") && (t.contains("广告") || t.contains("分钟"))) return true;
+        if (t.contains("看小视频") && t.contains("广告")) return true;
+        if ((t.contains("看") || t.contains("观看")) && t.contains("免") && t.contains("广告")) return true;
+        if (t.contains("畅听") && t.length() <= 6) return true;
         if (t.contains("激励视频") || t.contains("观看视频")) return true;
         if (t.contains("再看") && t.contains("分钟")) return true;
-        if (t.contains("免费畅听") || t.contains("免费听")) return true;
-        if (t.contains("借钱")) return true;
-        if (t.contains("公益")) return true;
+        // === 广告相关 ===
+        if (t.contains("广告") && (t.contains("免") || t.contains("看"))) return true;
+        if (t.contains("举报广告")) return true;
+        // === 商城/购物/金融 ===
+        if (t.contains("商城") || t.contains("购物") || t.contains("优惠券")) return true;
+        if (t.contains("借钱") || t.contains("公益")) return true;
+        if (t.contains("游戏中心") || t.contains("游戏") && t.length() <= 4) return true;
+        // === 直播（非听歌/阅读核心功能） ===
+        if (t.contains("直播") && t.length() <= 5) return true;
+        // === 资产/钱包 ===
+        if (t.contains("资产") || t.contains("钱包") || t.contains("购物车")) return true;
+        // === 领取/立即领取 ===
+        if (t.contains("立即领取") || t.contains("领取") && t.length() <= 6) return true;
+        // === 现金（排除带数字的余额显示） ===
+        if (t.contains("现金") && !t.matches(".*\\d+.*")) return true;
+        // === 做任务/任务 ===
+        if (t.contains("做任务") || (t.contains("任务") && t.length() <= 6)) return true;
+        // === 上滑商城 ===
+        if (t.contains("上滑") && t.contains("商城")) return true;
         return false;
     }
 
@@ -786,56 +1045,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 扫描听歌页所有无文本可点击 View（识别潜在广告位）；只跑一次，记录到日志 */
-    private void scheduleUnknownViewScanner() {
-        final Handler h = new Handler(Looper.getMainLooper());
-        h.postDelayed(new Runnable() {
-            @Override public void run() {
-                try { scanUnknownClickableViews(); } catch (Throwable t) {}
-            }
-        }, 5000);
-    }
-
-    /** 遍历当前 Activity 的 View 树，找出所有无文本/无 contentDescription 的可点击 View */
-    private void scanUnknownClickableViews() {
-        Activity top = getCurrentTopActivity();
-        if (top == null) return;
-        String actName = top.getClass().getName();
-        View decor = top.getWindow().getDecorView();
-        StringBuilder sb = new StringBuilder();
-        scanUnknownClickables(decor, 0, actName, sb);
-        if (sb.length() > 0) {
-            XposedBridge.log("[" + TAG + "] 听歌页未知可点击View: " + sb);
-        }
-    }
-
-    private void scanUnknownClickables(View v, int depth, String act, StringBuilder sb) {
-        if (v == null || depth > 30) return;
-        if (v.isClickable() || v.hasOnClickListeners()) {
-            boolean hasText = false;
-            if (v instanceof TextView) {
-                CharSequence cs = ((TextView) v).getText();
-                hasText = cs != null && cs.toString().trim().length() > 0;
-            }
-            if (!hasText && v.getContentDescription() == null) {
-                String rid = "";
-                try { rid = " id=" + v.getResources().getResourceEntryName(v.getId()); } catch (Throwable ignored) {}
-                int[] loc = new int[2];
-                try { v.getLocationOnScreen(loc); } catch (Throwable ignored) {}
-                sb.append("\n  ").append(v.getClass().getSimpleName())
-                  .append(rid)
-                  .append(" @[").append(loc[0]).append(",").append(loc[1]).append("]")
-                  .append(" ").append(v.getWidth()).append("x").append(v.getHeight());
-            }
-        }
-        if (v instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) v;
-            for (int i = 0; i < vg.getChildCount(); i++) {
-                scanUnknownClickables(vg.getChildAt(i), depth + 1, act, sb);
-            }
-        }
-    }
-
     /** 获取当前前台 Activity（简化版：取 decorView 所在 window 对应的 Activity） */
     private Activity getCurrentTopActivity() {
         try {
@@ -855,16 +1064,92 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    /** 延迟类可能在首个 Activity 后才加载；补偿性重试，避免首次 findClassIfExists 过早失败。 */
+    /** Hook 已知广告 View 类的构造函数 + ViewGroup.addView，创建即 GONE */
+    private void hookKnownAdViews() {
+        // 仅用全限定类名匹配，避免短名(如 "h"/"b")误伤阅读器渲染器等无关 View
+        final String[] AD_VIEW_FULL_NAMES = {
+                "com.bytedance.polaris.impl.novelug.progress.b",          // 阅读页右上角300金币
+                "com.dragon.read.admodule.adfm.unlocktime.entranceview.h", // 全天免费畅听中
+                "com.dragon.read.music.player.block.common.adunlock.MusicAdUnlockTimeView", // 听歌页广告解锁条
+                "com.dragon.read.admodule.adfm.unlocktime.AdUnlockTimeFloatingView",         // 浮动广告条
+        };
+        // 用全限定类名 HashSet 加速 addView 拦截
+        final Set<String> adFullNames = new HashSet<>();
+        for (String s : AD_VIEW_FULL_NAMES) adFullNames.add(s);
+        for (final String clsName : AD_VIEW_FULL_NAMES) {
+            try {
+                Class<?> cls = XposedHelpers.findClassIfExists(clsName, appCl);
+                if (cls == null) continue;
+                XposedHelpers.hookAllConstructors(cls, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            View v = (View) param.thisObject;
+                            v.setVisibility(View.GONE);
+                            XposedBridge.log("[" + TAG + "] 已拦截广告View(构造即GONE): " + clsName);
+                        } catch (Throwable ignored) {}
+                    }
+                });
+                XposedBridge.log("[" + TAG + "] 已注册广告View构造hook: " + clsName);
+            } catch (Throwable ignored) {}
+        }
+        // Hook ViewGroup.addView：用全限定类名匹配（不用短名，避免误伤）
+        try {
+            XposedHelpers.findAndHookMethod(ViewGroup.class, "addView", View.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        View child = (View) param.args[0];
+                        if (child == null) return;
+                        String fullClsName = child.getClass().getName();
+                        if (adFullNames.contains(fullClsName)) {
+                            child.setVisibility(View.GONE);
+                            XposedBridge.log("[" + TAG + "] 已拦截广告View(addView时GONE): " + fullClsName);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            XposedBridge.log("[" + TAG + "] ViewGroup.addView 拦截器已启用");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] ViewGroup.addView 拦截失败: " + t);
+        }
+        // Hook View.setVisibility：当广告 View 被设为 VISIBLE 时立即 GONE（防止重建后闪现）
+        try {
+            final Set<String> adFullNamesFinal = adFullNames;
+            XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        int vis = (int) param.args[0];
+                        if (vis != View.VISIBLE) return;
+                        View v = (View) param.thisObject;
+                        String cls = v.getClass().getName();
+                        if (adFullNamesFinal.contains(cls)) {
+                            param.args[0] = View.GONE;
+                            XposedBridge.log("[" + TAG + "] setVisibility拦截: " + cls + " → GONE");
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            XposedBridge.log("[" + TAG + "] View.setVisibility 拦截器已启用");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] View.setVisibility 拦截失败: " + t);
+        }
+    }
+
+    /** 延迟类可能在首个 Activity 后才加载；多次重试（3s/8s/15s/30s），避免首次 findClassIfExists 过早失败。 */
     private void scheduleAdSignalRetry() {
         final Handler h = new Handler(Looper.getMainLooper());
-        h.postDelayed(new Runnable() {
-            @Override public void run() {
-                try { hookAdSignals(); } catch (Throwable t) {
-                    XposedBridge.log("[" + TAG + "] 延迟广告 hook 失败: " + t);
+        final long[] delays = {5000, 15000, 30000};
+        for (long delay : delays) {
+            h.postDelayed(new Runnable() {
+                @Override public void run() {
+                    try {
+                        hookAdSignals();
+                        hookKnownAdViews();
+                    } catch (Throwable t) {
+                        XposedBridge.log("[" + TAG + "] 延迟广告 hook 失败: " + t);
+                    }
                 }
-            }
-        }, 2500);
+            }, delay);
+        }
     }
 
     /** 源码级广告拦截：解锁时长倒计时弹窗/倒计时条 + 激励广告SDK入口 */
@@ -957,6 +1242,90 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {}
     }
 
+    /**
+     * 精准拦截 DialogFragment 广告弹窗（不走 Dialog.show()，走 FragmentManager，之前全部漏掉）。
+     * 依据 APK 分析：章节末"看小视频免30分钟广告" = ReaderInspireDialogFragment（DialogFragment）。
+     * 1) 通用 hook androidx DialogFragment.show()：类名含广告关键词直接短路。
+     * 2) 精确 hook 已知广告 Fragment 的 onCreateView：返回 null 阻止渲染。
+     */
+    private void hookDialogFragmentBlocker() {
+        // 通用：androidx DialogFragment.show 两个重载
+        final String[] SHOW_SIGS = {
+                "androidx.fragment.app.DialogFragment",
+        };
+        try {
+            Class<?> dfCls = XposedHelpers.findClassIfExists("androidx.fragment.app.DialogFragment", appCl);
+            if (dfCls != null) {
+                XC_MethodHook showHook = new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            Object frag = param.thisObject;
+                            String n = frag.getClass().getName();
+                            if (isAdFragmentClass(n)) {
+                                param.setResult(null);
+                                XposedBridge.log("[" + TAG + "] 已拦截广告DialogFragment(show): " + n);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                };
+                try { XposedHelpers.findAndHookMethod(dfCls, "show", "androidx.fragment.app.FragmentManager", String.class, showHook); } catch (Throwable ignored) {}
+                try { XposedHelpers.findAndHookMethod(dfCls, "show", "androidx.fragment.app.FragmentTransaction", String.class, showHook); } catch (Throwable ignored) {}
+                // 兜底：onStart（此时尚未真正展示窗口，可 dismiss）
+                XC_MethodHook onStartHook = new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object frag = param.thisObject;
+                            String n = frag.getClass().getName();
+                            if (isAdFragmentClass(n)) {
+                                try { param.thisObject.getClass().getMethod("dismiss").invoke(param.thisObject); } catch (Throwable ignored2) {}
+                                XposedBridge.log("[" + TAG + "] 已拦截广告DialogFragment(onStart): " + n);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                };
+                try { XposedHelpers.findAndHookMethod(dfCls, "onStart", onStartHook); } catch (Throwable ignored) {}
+                XposedBridge.log("[" + TAG + "] DialogFragment 拦截器已启用");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] DialogFragment 拦截器失败: " + t);
+        }
+
+        // 精确 hook 已知广告 Fragment 的 onCreateView：返回 null 阻止渲染
+        final String[] AD_FRAGMENTS = {
+                "com.dragon.read.reader.ad.dialog.newstyle.ReaderInspireDialogFragment",   // 章节末"看小视频免30分钟广告"
+                "com.dragon.read.reader.speech.ad.listen.dialog.newstyle.InspireDialogFragment", // 听书激励弹窗
+                "com.dragon.read.reader.ad.dialog.newstyle.InterruptAdReaderDialogNew",     // 阅读中断广告
+                "com.dragon.read.reader.ad.dialog.newstyle.ReaderRuleDescriptionFragment",  // 广告规则说明
+        };
+        for (final String clsName : AD_FRAGMENTS) {
+            try {
+                Class<?> cls = XposedHelpers.findClassIfExists(clsName, appCl);
+                if (cls == null) continue;
+                XposedHelpers.findAndHookMethod(cls, "onCreateView",
+                        "android.view.LayoutInflater", "android.view.ViewGroup", "android.os.Bundle",
+                        new XC_MethodHook() {
+                            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                                param.setResult(null);
+                                XposedBridge.log("[" + TAG + "] 已拦截广告Fragment(无View): " + clsName);
+                            }
+                        });
+                XposedBridge.log("[" + TAG + "] 已注册广告Fragment hook: " + clsName);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    /** 判断 Fragment 类名是否命中广告弹窗关键词（保守，仅广告 SDK/弹窗类） */
+    private boolean isAdFragmentClass(String n) {
+        if (n == null) return false;
+        String l = n.toLowerCase();
+        // 阅读器激励/中断广告
+        if (l.contains("inspire") || l.contains("interruptad") || l.contains("interrupt_ad")) return true;
+        // 广告弹窗通用关键词（限定在 ad 相关包，避免误伤）
+        if ((l.contains("ad") || l.contains("advert")) && (l.contains("dialog") || l.contains("pop") || l.contains("unlock"))) return true;
+        if (l.contains("luckycat") || l.contains("reward") && l.contains("dialog")) return true;
+        return false;
+    }
+
     private void hookDialogBlocker() {
         final Handler h = new Handler(Looper.getMainLooper());
         try {
@@ -971,7 +1340,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                 || name.contains("Update") || name.contains("Upgrade")
                                 || name.contains("AdDialog") || name.contains("AdPop")
                                 || name.contains("Advert") || name.contains("VipPaying")
-                                || name.contains("UnlockTime");
+                                || name.contains("UnlockTime") || name.contains("Coin")
+                                || name.contains("Reward") || name.contains("Task")
+                                || name.contains("Welfare") || name.contains("RedPacket")
+                                || name.contains("Sign") || name.contains("Invite")
+                                || name.contains("Mall") || name.contains("Shop");
                         if (classHit) {
                             dlg.dismiss();
                             XposedBridge.log("[" + TAG + "] 已拦截弹窗(类名): " + name);
@@ -1031,13 +1404,25 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private boolean isDialogBad(String t) {
-        if (t.contains("签到") && t.length() <= 8) return true;
-        if (t.contains("听歌")) return true;
-        if (t.contains("领取") && t.contains("金币")) return true;
+        // 签到/领金币/红包弹窗
+        if (t.contains("签到") && t.length() <= 10) return true;
+        if (t.contains("领取") && (t.contains("金币") || t.contains("红包") || t.length() <= 8)) return true;
+        if (t.contains("可领取") || t.contains("待领取") || t.contains("去领取")) return true;
+        if (t.contains("金币翻倍") || t.contains("金币待")) return true;
+        // 听歌/听书任务弹窗
+        if (t.contains("听歌") && t.length() <= 12) return true;
+        if (t.contains("做任务") || t.contains("任务完成")) return true;
+        // 广告相关
         if (t.contains("广告")) return true;
-        if (t.contains("跳过") && t.length() <= 12) return true;
         if (t.contains("激励视频") || t.contains("观看视频")) return true;
-        if (t.contains("广告") && (t.contains("免费") || t.contains("解锁") || t.contains("继续"))) return true;
+        if (t.contains("跳过") && t.length() <= 14) return true;
+        if (t.contains("免广告") || t.contains("免费畅听") || t.contains("免费听")) return true;
+        // 限时/促销弹窗
+        if (t.contains("限时") || t.contains("新人红包")) return true;
+        if (t.contains("邀请") && (t.contains("好友") || t.contains("返现"))) return true;
+        // 畅听/VIP推销
+        if (t.contains("畅听") && t.length() <= 12) return true;
+        if (t.contains("会员") && (t.contains("领取") || t.contains("体验"))) return true;
         return false;
     }
 
@@ -1166,7 +1551,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     CharSequence cs = ((TextView) c).getText();
                     String ts = cs == null ? "" : cs.toString().trim();
                     coinText = ts.contains("金币") || ts.contains("领取") || ts.contains("广告")
-                            || ts.contains("赚") || ts.matches(".*\d+金币.*");
+                            || ts.contains("赚") || ts.matches(".*\\d+金币.*");
                 }
                 // 宽松条件：位于屏幕上部 20% 且右侧超过 50% 屏宽
                 boolean topRight = top >= 0 && top < screenH * 0.20f
@@ -1178,9 +1563,10 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (c instanceof ViewGroup) scanTopRight((ViewGroup) c, cnt, screenW, screenH, act);
                     continue;
                 }
-                // 匹配：含金币文本，或非 TextView 的可点击/有监听器的 View（排除导航栏）
+                // 匹配：含金币文本，或自身可点击，或子 View 中有可点击的（如金币图标在不可点击容器内）
                 boolean isCoin = coinText
-                        || ((c.isClickable() || c.hasOnClickListeners()) && !(c instanceof TextView));
+                        || (c.isClickable() || c.hasOnClickListeners())
+                        || hasClickableChild(c);
                 if (isCoin) {
                     hideTopRightWidget(c, coinText ? "金币入口" : c.getClass().getSimpleName(), cnt, act);
                     return;
@@ -1188,5 +1574,46 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
             if (c instanceof ViewGroup) scanTopRight((ViewGroup) c, cnt, screenW, screenH, act);
         }
+    }
+
+    /** 检查 View 的直接子节点是否有可点击的（用于识别金币图标等无文字但子节点可点击的容器） */
+    private boolean hasClickableChild(View v) {
+        if (!(v instanceof ViewGroup)) return false;
+        ViewGroup vg = (ViewGroup) v;
+        for (int i = 0; i < vg.getChildCount(); i++) {
+            View child = vg.getChildAt(i);
+            if (child != null && (child.isClickable() || child.hasOnClickListeners())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 检查 View 子树是否包含广告相关文本（用于识别广告容器） */
+    private boolean viewContainsAdText(View v, int depth) {
+        if (v == null || depth > 8) return false;
+        if (v instanceof TextView) {
+            try {
+                CharSequence cs = ((TextView) v).getText();
+                if (cs != null) {
+                    String t = cs.toString().trim();
+                    if (t.length() > 0 && t.length() <= 20) {
+                        if (t.contains("金币") || t.contains("畅听") || t.contains("广告")
+                                || t.contains("领取") || t.contains("赚钱") || t.contains("福利")
+                                || t.contains("免费") || t.contains("免广告") || t.contains("签到")
+                                || t.contains("红包") || t.contains("做任务") || t.contains("激励视频")) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (viewContainsAdText(vg.getChildAt(i), depth + 1)) return true;
+            }
+        }
+        return false;
     }
 }
