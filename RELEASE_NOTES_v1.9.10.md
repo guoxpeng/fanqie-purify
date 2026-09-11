@@ -73,28 +73,13 @@
 
 ## 安装步骤
 
-1. **安装模块 APK**
-   ```bash
-   pm install -r /path/to/fanqie-purify.apk
-   ```
-2. **在 Vector / LSPosed 中启用本模块**，作用域勾选番茄畅听
-   ```
-   /data/adb/lspd/cli modules enable com.eta.fanqie.enhance
-   /data/adb/lspd/cli scope add com.eta.fanqie.enhance com.xs.fm/0
-   ```
-3. **强制停止番茄畅听后重新打开**（模块随目标进程注入，必须重启目标进程才生效）
-   ```bash
-   am force-stop com.xs.fm
-   ```
-4. （可选）登录账号，仅用于获得完整 VIP 免听体验。
+1. 手机已 **Root**，并装好 **LSPosed** 或 **Vector**（两者任选其一）
+2. 安装本模块 APK
+3. 打开 LSPosed / Vector 管理器，**启用本模块**
+4. 在模块的**作用域**里勾选 **番茄畅听**
+5. 强制停止番茄畅听（或重启手机）后重新打开，即可生效
 
-### 验证是否生效（⚠️ 日志不在 logcat）
-
-```bash
-adb shell "su -c 'grep FanqieEnhance /data/adb/lspd/log/verbose_*.log | tail -20'"
-```
-
-看到 `[FanqieEnhance] v1.9.10 加载: process=com.xs.fm` 与 `已patch userModel: isVip=true freeAd=true leftTime=999999999` 即成功。
+> 不需要登录账号 —— 去广告与界面净化直接生效；想要完整 VIP 免听体验再登录即可。
 
 ---
 
