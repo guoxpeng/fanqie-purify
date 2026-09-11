@@ -15,8 +15,13 @@ phone_screen.png
 artifacts/
 dragon_read_decompiled/
 fanqie_decompiled/
-*.apk
 classes.dex.bak
+
+# 目标应用原始 APK（体积巨大，不入库）
+/fanqie_671.apk
+/fanqie_latest.apk
+/dragon_read_latest.apk
+/dragon_read_latest_phone.apk
 
 # 本地构建输出目录（build_v197 / v198 / v199 / v1910 ...）
 module/build_v*/
