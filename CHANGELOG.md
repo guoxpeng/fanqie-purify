@@ -20,21 +20,51 @@
 - 番茄畅听 6.6.7.32 (versionCode 667)
 - 版本号语义化 1.9.5 (versionCode 19500)
 
-## [v20/v1.9.6 ~ v1.9.10] - 2026-08-28
+## [v1.9.10] - 2026-09-11
+
+### 适配
+- **番茄畅听 `6.7.1.16`（versionCode `671`）实测通过**：逐一核对模块用到的 16 个混淆类名 / 资源 id，全部仍存在于 6.7.1.16（含 `h80` / `bpz` / `e33` / `ccv` / `c1` / `e10` 等）
+- 模块版本号 `1.9.10`（versionCode `191000`）
+
+### 修复
+- **未登录时「我的」页头部整块消失**（下拉才短暂出现，上滑到「全部」一行就没了）
+  - 根因：未登录头部文案命中 `shouldHide()` 中过宽的 `t.contains("领取") && t.length() <= 6` 规则，随后 `hideEntry → hideChain` 向上连藏 3 层父容器，把 `#h4z`（头像 + 昵称 + 登录按钮）和 `#e10`（整个头部 `LinearLayout`）一并 GONE
+  - `#e10` 的类名是普通 `android.widget.LinearLayout`、不含 AppBar，`isProtectedContainer()` 的类名白名单拦不住它；真正受保护的 `#c1`（`CommonCustomAppBarLayout`）在更外层，等循环走到它时头部内容早已被隐藏
+  - 修复：`hideChain()` 开头新增「整链放弃」判定 —— 用新增的 `isAppBarLike()` 沿 `start` 父链一路向上找 `AppBar`/`Toolbar`/`ActionBar`/`TabLayout`，只要命中就整条链放弃，一帧都不动
+
+### 免登录（重要）
+- **确认：去广告与入口隐藏完全不依赖登录账号**
+  - 在完全未登录（清空 `prefix_private_acct_user_info_cache` MMKV）状态下实测：日志正常输出 `已patch userModel: isVip=true freeAd=true leftTime=999999999`；首页 / 我的页 / 听歌页的广告位、金币球、福利入口均正常隐藏
+  - 说明：VIP 状态**可以**在未登录（游客态）下写入，但实际能否试听 VIP 内容仍由番茄**服务端**校验决定，模块不绕过服务端
+  - README 新增「免登录说明」独立章节
+
+### 文档
+- README / SUMMARY / CHANGELOG 全面更新，突出**适配版本号 `6.7.1.16`（`671`）**
+- 修正安装步骤：删除「必须先登录」的过时要求（顺序放宽为 装模块 → 启用作用域 → 强停重启）
+- 修正生效验证方式：模块日志**不在 logcat**，改指 `/data/adb/lspd/log/verbose_*.log`（tag `VectorLegacyBridge`）
+
+### ⚠️ 走过的弯路（记录备查，勿重犯）
+- 第一版修复用的是「文案含『登录』就放过」的粗粒度白名单。结果「登录领取」既是「我的」页头部的账号入口、又是首页 / 我的页右侧那个浮动红包广告的文案，白名单把广告一起放过了（用户当场反馈「首页的登录领取广告又回来了」）。**结论：必须用结构判定（在不在顶栏里），不能用文案判定。**
+- `isAppBarLike()` 故意**不复用** `isProtectedContainer()`：后者把 `"TopView"` 也算受保护，而 `BookMallTopView`（首页搜索栏那一行）类名里含 `TopView`、首页广告位就装在它里面，复用会把首页广告一起放过。
+
+## [v1.9.6 ~ v1.9.9] - 2026-09-10
 
 ### 新增
-- 源码级拦截解锁时长倒计时：`AdUnlockTimeDialogManager.realShowDialog` 等弹窗入口直接短路；`MusicAdUnlockTimeView`/`AdUnlockTimeFloatingView` 构造即 GONE（听歌页倒计时条/悬浮条）
+- **贴片广告视觉拦截（v1.9.9）**：听歌页随机出现的「贴片广告」由字节 Lynx（`com.ss.android.mannor`）模板渲染，装在 `MusicPatchAdContainer` 内、无固定资源 id。改为视觉层面拦截：hook 容器构造 + `View.setVisibility`，只置 `GONE`、绝不 `removeView`（`ViewStub` 只能 inflate 一次，remove 会抛异常）
+- 源码级拦截解锁时长倒计时：`AdUnlockTimeDialogManager.realShowDialog` 等弹窗入口直接短路；`MusicAdUnlockTimeView`/`AdUnlockTimeFloatingView` 构造即 GONE（听歌页倒计时条 / 悬浮条）
 - 右上角金币/领取/免费入口（阅读页「200金币」等）：`hideTopRightWidget` 向上找到含底色的 widget 容器整体 GONE；`scanTopRight` 放宽 TextView 候选
 - BLOCKED 新增 `EcCenterActivity`、`adfm.unlocktime.` 前缀；Dialog 文本规则增加「广告」「跳过」
 - `hookShortcutCleaner`/`removeAdShortcuts` 桌面快捷方式清理（自 v19 保留）
+- **`View.setVisibility` 拦截**：已知广告 View 设 VISIBLE 时强制 GONE（防重建闪现）
 
 ### 修复
 - **顶部菜单标签误伤（v19 老问题）**：`hideAdCard` 曾把 AppBarLayout（含标签栏）整体 INVISIBLE。v21 加 `isProtectedContainer`（AppBar/TopView/TabLayout/主导航/RadioButton≥2）；v23 升级 `protectedWithin`（候选 3 层内含受保护容器也拒绝）；v24 广告卡候选必须 widget 级（宽度<60%屏宽）——「全天畅听」banner 只藏 142x113 药丸，顶栏无损
 - 隐藏动作加 visibility 去重，消除同目标每 300ms 重复日志（1040→1 条）
-- 本地构建链修复：stub 补 `XposedBridge.hookAllMethods`；`assets/xposed_init` 打包位置修正
+- 本地构建链修复：stub 补 `XposedBridge.hookAllMethods`/`hookAllConstructors`；`assets/xposed_init` 打包位置修正
 
 ### 已知问题
 - 设备 PMIC 看门狗脏重启后 PM 状态可能损坏：第三方 App 解析失效/无法启动，需 `install -r` base.apk 重建 resolver；此时 Vector 守护进程可能整个开机周期不注入模块，需 PM 恢复后强停重启目标 App
+- 首页搜索栏右侧「全天畅听」胶囊在冷启动首帧仍可能出现极短闪现（构造期已 GONE，疑为 Lynx 广告层叠加渲染，持续跟进）
 
 ## [v19.2] - 2026-08-24
 

@@ -1,5 +1,8 @@
 # 番茄畅听净化模块 v1.9.5 (versionCode 19500)
 
+> ⚠️ **本文档为历史版本说明**（当时适配 6.6.7.32 / 667）。
+> 最新版本见 [RELEASE_NOTES_v1.9.10.md](RELEASE_NOTES_v1.9.10.md) —— 适配番茄畅听 **6.7.1.16（versionCode 671）**，且**不再要求先登录**。
+
 > 目标应用：番茄畅听 com.xs.fm（实测 6.6.7.32 / versionCode 667）
 > 框架要求：Root + Vector / LSPosed（xposedminversion 82，Android 8.0+）
 

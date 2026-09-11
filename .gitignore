@@ -7,3 +7,25 @@ module/stub_classes/
 .freebuff/
 MEMORY_TRAPS.md
 phone_screen.png
+
+# ===== 逆向 / 构建中间产物（体积巨大，不入库） =====
+.decompile/
+.extract/
+.buildtmp/
+artifacts/
+dragon_read_decompiled/
+fanqie_decompiled/
+*.apk
+classes.dex.bak
+
+# 本地构建输出目录（build_v197 / v198 / v199 / v1910 ...）
+module/build_v*/
+
+# ===== 本机专用工具脚本（内含本机绝对路径，不入库） =====
+module/build_v*.py
+module/deploy.py
+tools/
+
+# ===== 工作记忆（本地） =====
+.workbuddy-ai/
+MODULE_MEMORY.md
