@@ -23,7 +23,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * 番茄畅听增强模块 v1.9.10（适配 6.7.1.16 / versionCode 671）
+ * 番茄畅听增强模块 v1.9.20（适配 6.7.1.32 / versionCode 671）
  * 基底 = v1.9.5：VIP patch、底部商城/领现金tab隐藏、广告卡整体隐藏、
  *   三级入口隐藏(hideEntry/hideShallow/hideChain)、桌面快捷方式清理、阅读页金币面板、弹窗拦截。
  * 合入 adfix 增强：hookAdSignals 源码级拦截广告SDK调用、更广 BLOCKED 页面前缀。
@@ -59,6 +59,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   - isAppBarLike() 故意不复用 isProtectedContainer()：后者把 "TopView" 也算受保护，
  *     而 BookMallTopView（首页搜索栏那一行）类名含 "TopView"、里面就装着首页广告位，
  *     复用会把首页广告一起放过。
+ * v1.9.11 新增「广告位总闸」hookAdConfigGate()（参考同类项目 FanqieHook 的思路）：
+ *   - 定位：反汇编 classes14.dex 得到
+ *     com.dragon.read.base.ad.AdConfigManager.checkAdAvailable(String, String) : boolean
+ *   - 做法：按「广告位字符串」在**广告请求/渲染之前**直接返回 false，
+ *     一次 hook 覆盖全部被动广告位，天然没有「渲染一帧后才隐藏」的闪烁。
+ *   - 只拦被动展示位（splash_ad / page_front_ad / page_middle_ad / reader_banner /
+ *     audio_patch_ad / audio_info_flow），用户主动触发的激励视频/金币流程一律放行。
+ *   - 同时把所有出现过的广告位打一条日志，便于换版本后重新收集黑名单。
+ *   - ⚠️ 不能照搬对方类名：NsAdImpl / NsVipImpl 在畅听里不存在（基线版本不同）。
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -119,6 +128,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final long MIN_HIDE_INTERVAL = 1200; // hideAll 最小间隔 1.2秒，避免卡顿
     private boolean hasListenerAttached = false;      // 防止重复注册 OnGlobalLayout
     private boolean patchAdContainerHooked = false;   // v1.9.9 听歌页贴片视频广告容器 hook 已注册
+    private View minePageDecor = null;                // v1.9.20 isMinePage 缓存（同一 decor 只判定一次）
+    private boolean minePageFlag = false;
     private Object patchedUserModel = null;           // v1.9.9 已 patch 的 AcctUserModel 实例（登出会换新实例 → 需重新 patch）
     private Set<Integer> cachedHideIds = null;        // v1.9.9 需要「按资源ID强制隐藏」的 viewId 集合（我的页VIP卡/资产卡等）
     /**
@@ -133,12 +144,127 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String PATCH_AD_CONTAINER_CLS =
             "com.dragon.read.music.player.widget.MusicPatchAdContainer";
 
+    /**
+     * v1.9.11 新增、v1.9.12 按 6.7.1.32 重新提取：已知广告资源 ID 硬编码集合。
+     *
+     * 说明：6.7.1.32 的 versionCode 仍是 671，混淆「名字表」没变（gxi/bwf/gtr/... 这些
+     * 资源名在两版里都存在、模块的 getIdentifier 按名查找逻辑无需改动），但**资源 ID 的
+     * 数值整体平移了**，所以下面这些硬编码整数必须按新版重新提取，否则
+     * ViewGroup.addView 预拦截会对着一批不存在的 id 空转。
+     * 提取命令：aapt d resources fanqie_67132.apk | grep -E 'resource 0x[0-9a-f]+ .*id/'
+     * 用于 ViewGroup.addView 时的预拦截，在 View 被添加进树之前就直接 GONE，
+     * 彻底消除「首帧闪现」问题（事后 setVisibility/GONE 仍会先渲染一帧）。
+     * 这些 ID 从 aapt2 dump resources 获得，只对该版本有效；换版本后需重新提取。
+     */
+    private static final Set<Integer> PRE_HIDE_RES_IDS = new HashSet<>(java.util.Arrays.asList(
+            0x7f102989, // id/gxi  主页顶部"全天畅听"入口
+            0x7f100e89, // id/bwf  阅读页全天免费畅听中容器
+            0x7f1028fe, // id/gtr  阅读页全天免费畅听文本
+            0x7f10062d, // id/abz  阅读页300金币 ImageView
+            0x7f10062b, // id/abx  阅读页300金币容器
+            0x7f1004c5, // id/a3c  听歌页横幅广告
+            0x7f1022e9  // id/fp_  听歌页卡片广告
+    ));
+
+    /**
+     * v1.9.11 广告位总闸所在类。
+     *
+     * 反汇编 6.7.1.16（classes14.dex）确认：
+     *   Class descriptor : 'Lcom/dragon/read/base/ad/AdConfigManager;'
+     *     name   : 'checkAdAvailable'
+     *     type   : '(Ljava/lang/String;Ljava/lang/String;)Z'
+     *     access : 0x0011 (PUBLIC FINAL)
+     * 该类是单例（Companion.getInstance() / 合成方法 a()），静态字段 b 持有实例、
+     * 静态字段 a 是 HashSet（广告位集合）。
+     *
+     * 定位命令（换版本后重跑）：
+     *   dexdump.exe <dex> | awk '/Class descriptor/{c=$0} /name.*: .checkAdAvailable./{print c; print $0}'
+     */
+    private static final String AD_CONFIG_MANAGER_CLS = "com.dragon.read.base.ad.AdConfigManager";
+
+    /**
+     * v1.9.11 需要从源头拦截的「被动展示型」广告位。
+     *
+     * ⚠️ 设计原则（参考同类项目 FanqieHook 的做法）：**只拦被动展示位**，
+     *    用户主动触发的激励视频 / 金币 / 「看广告免广告」流程一律放行，
+     *    否则会破坏用户自己的正常操作路径。
+     *
+     * 下面这些字符串均在 6.7.1.16 的 dex 里实际存在（逐个 grep 验证过）。
+     * 换版本后如果某个位置不再出现，直接删掉即可，不影响其他项。
+     */
+    private static final Set<String> BLOCKED_AD_POSITIONS = new HashSet<>(java.util.Arrays.asList(
+            "splash_ad",          // 开屏广告
+            "page_front_ad",      // 信息流首屏广告（首页搜索栏上方那个一闪而过的块）
+            "page_middle_ad",     // 信息流中插广告
+            "reader_banner",      // 阅读页底部 banner
+            "audio_patch_ad",     // 听书/听歌页贴片广告
+            "audio_patch_pre_ad", // 听书贴片前置广告
+            "audio_info_flow",    // 听书信息流广告
+            // ⚠️ "book_mall_feed_ad" 已移除：该广告位与听书页正常 UI（tab/三个点菜单）绑定，
+            //    拦截会导致正常功能消失。商店图标改用 View 层定位隐藏。
+            "mini_game_config",   // 小游戏广告配置
+            "free_ad_enter"       // 免费广告入口（看广告解锁等）
+    ));
+
+    /**
+     * v1.9.12 新增：阅读页 Lynx 广告「场景键」黑名单（6.7.1.32 实测）。
+     *
+     * <p>屏幕上的广告：阅读页正文流里插进来的推广卡（图片 + 标题「曲靖恒源家居购物公司」
+     * + 描述 + 「反馈」按钮），bounds≈[140,1452][940,1884]。它**不在 View 树里带资源 id**
+     * （uiautomator dump 出来只有一堆无 id 的 ViewGroup，只有 content-desc 有无障碍文案），
+     * 因为它由字节 Lynx 广告引擎自绘——运行日志可见 App 拉取缓存 tag
+     * {@code reader_lynx_video_ad}，dex 里该字符串正是 gk2/a（TTVideoEngine 配置）
+     * 用来选广告场景的键。
+     *
+     * <p>为什么之前拦不住：模块原有的「广告位总闸」hook 的是
+     * {@code AdConfigManager.checkAdAvailable(position, source)}，而 Lynx 广告走的是
+     * {@code com.dragon.read.lynx.AdLynxHelper.checkIfRitAvailable(scene, rit)}：
+     * 它先把 scene 经 {@code PatchAndInfoFlowAdConfigAdapter.transConfigPositionFromScene(scene)}
+     * 翻译成配置位（未知 scene 会落到默认值 {@code audio_patch_ad}），再拿翻译结果去
+     * checkAvailable。scene 本身根本没进过 checkAdAvailable，所以黑名单加场景键无效。
+     *
+     * <p>拦截点：直接 hook {@code AdLynxHelper.checkIfRitAvailable}，命中这些场景键时返回
+     * 该方法的「校验不通过」返回值 {@code ad_available_check_rit_disenable}。
+     * 这是 App 自己的失败分支：调用方 requestAd 收到非 {@code ad_available_check_ok}
+     * 就 {@code listener.onRequestFailed(-4, "rit校验不通过")}，**在广告请求/渲染之前**就中止，
+     * 不会打断任何状态机，也不会出现「渲染一帧后才隐藏」的闪烁。
+     *
+     * <p>只放被动展示型场景：{@code reward_ad}（激励视频）等用户主动触发的一律不在此列。
+     */
+    private static final Set<String> BLOCKED_LYNX_AD_SCENES = new HashSet<>(java.util.Arrays.asList(
+            "reader_lynx_video_ad",   // 阅读页正文流 Lynx 推广卡（本次屏幕上的广告）
+            "reading_video_ad",       // 阅读页视频广告
+            "series_lynx_video_ad",   // 系列/短剧 Lynx 广告
+            "landing_video_ad"        // 落地页 Lynx 视频广告
+    ));
+
+    /** v1.9.11 已出现过的广告位（只打印一次，避免刷屏） */
+    private final Set<String> seenAdPositions = new HashSet<>();
+    /** v1.9.11 已拦截过的广告位（只打印一次） */
+    private final Set<String> blockedAdPositions = new HashSet<>();
+    /** v1.9.11 广告位总闸是否已挂载 */
+    private boolean adConfigGateHooked = false;
+    /** v1.9.12 已出现过的 Lynx 广告场景键（每个只打印一次，便于换版本后重新收集） */
+    private final Set<String> seenLynxScenes = new HashSet<>();
+    /** v1.9.12 Lynx 广告场景拦截器是否已注册（幂等，防重复 hook） */
+    private boolean lynxAdHookDone = false;
+    /** v1.9.15 已打印过「OneStop 广告策略拦截」日志的 key（策略在每次翻页都会被调用，只打一次避免刷屏） */
+    private final Set<String> oneStopBlockedLogged = new HashSet<>();
+    /** v1.9.17 已打印过祖先链的广告文本（用于反查入口的宿主类） */
+    private final Set<String> loggedAdEntryChain = new HashSet<>();
+    /** v1.9.18 阅读页广告入口行工厂是否已挂载 */
+    private boolean readerAdLineHooked = false;
+    /** v1.9.19 首页 VIP 促销全屏弹层拦截是否已挂载 */
+    private boolean vipPromoHooked = false;
+    /** v1.9.18 已屏蔽过的广告入口行（只打一次日志） */
+    private final Set<String> readerAdLineBlocked = new HashSet<>();
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         if (!"com.xs.fm".equals(lpparam.packageName)) {
             return;
         }
-        XposedBridge.log("[" + TAG + "] v1.9.10 加载: process=" + lpparam.processName);
+        XposedBridge.log("[" + TAG + "] v1.9.19 加载: process=" + lpparam.processName);
         this.appCl = lpparam.classLoader;
         hookActivityBlocker();
         hookDialogBlocker();
@@ -152,6 +278,11 @@ public class MainHook implements IXposedHookLoadPackage {
         hookAbsQueueBottomSheetDialog(); // v1.9.7 新增：拦截语音领金币等走 silk subwindow 的 BottomSheet 广告
         hookSilkSubwindowManager();      // v1.9.7 新增：拦截页面弹窗广告（silk subwindow 中央调度）
         hookMusicPatchAd();              // v1.9.9 新增：拦截听歌页 Lynx 贴片视频广告（看小视频免广告）
+        hookAdConfigGate();              // v1.9.11 新增：广告位总闸（源码级，从源头拦截被动广告位）
+        hookLynxAdBlocker();             // v1.9.12 新增：阅读页 Lynx 广告场景拦截（reader_lynx_video_ad 等）
+        hookOneStopReaderAd();           // v1.9.14 新增：从源头关闭阅读页 OneStop 一站式广告（去空白）
+        hookReaderAdLineFactory();       // v1.9.18 新增：从源头屏蔽章节末广告入口行（看小视频免30分钟广告等）
+        hookVipPromotionPopup();         // v1.9.19 新增：从源头屏蔽首页 VIP 促销全屏弹层
         scheduleAdSignalRetry();
     }
 
@@ -281,6 +412,41 @@ public class MainHook implements IXposedHookLoadPackage {
                             cur = p;
                         } else {
                             break;
+                        }
+                    }
+                    // v1.9.16 补充：章节末「看小视频免30分钟广告」这类入口是一个**整宽可点击容器**
+                    // （6.7.1.32：id=dls，bounds=[0,1418][1080,1640]），上面的爬升循环因为
+                    // 「宽>=90%屏宽 = 页面级」会提前 break，结果只隐藏了内部文字行，
+                    // 外框/箭头/点击区还在，看起来还是「广告入口」。
+                    // 对这类入口改为：往上找到**最近的可点击祖先**，整块 GONE，
+                    // 入口连外框一起消失（且不依赖资源 id 数值，换版本也稳）。
+                    if (t.contains("看小视频") || t.contains("免广告")) {
+                        // 诊断：把祖先链（类名 + 资源名）打一次，方便定位入口宿主类
+                        if (loggedAdEntryChain.add(t)) {
+                            try {
+                                StringBuilder sb = new StringBuilder();
+                                View p = v;
+                                for (int i = 0; i < 12 && p != null; i++) {
+                                    sb.append(p.getClass().getName());
+                                    int pid = p.getId();
+                                    if (pid != View.NO_ID) {
+                                        try {
+                                            sb.append("#").append(v.getResources().getResourceEntryName(pid));
+                                        } catch (Throwable ignored3) {}
+                                    }
+                                    sb.append(p.isClickable() ? "[clickable]" : "");
+                                    sb.append(" > ");
+                                    p = (p.getParent() instanceof View) ? (View) p.getParent() : null;
+                                }
+                                XposedBridge.log("[" + TAG + "] 广告入口祖先链['" + t + "']: " + sb);
+                            } catch (Throwable ignored4) {}
+                        }
+                        View p = v;
+                        for (int i = 0; i < 6; i++) {
+                            View parent = (p.getParent() instanceof View) ? (View) p.getParent() : null;
+                            if (parent == null) break;
+                            p = parent;
+                            if (p.isClickable()) { target = p; break; }
                         }
                     }
                     if (target.getVisibility() != View.GONE) {
@@ -498,15 +664,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private void registerForceHideIds(Activity act) {
         if (cachedHideIds != null || act == null) return;
         try {
+            // v1.9.20：6.7.1.32 的「我的」页布局换了资源名 —— 旧的 bpz/e33/ccv/gzy/gr0 在本版
+            //          已不存在（getIdentifier 返回 0，等于空转），必须换成下面这组新名，
+            //          否则 VIP 促销卡与「我的资产」板块会照常显示。
             String[] names = {
-                    "bpz",  // 我的页 VIP 宣传卡片（外层 ConstraintLayout 容器）
-                    "e33",  // 我的资产卡片（外层 LinearLayout 容器）
-                    "ccv",  // 我的消息卡片（RelativeLayout 容器）
-                    "gzy",  // 尊享免广告权益文案
-                    "gr0",  // ¥14 开通按钮
-                    "gjj",  // 金币余额(币) 标签
-                    "gio",  // 现金余额(元) 标签
-                    "gy0",  // 剩余时长(分) 标签
+                    "br7",  // 我的页 VIP 促销卡片（外层 ViewGroup 容器）
+                    "gtn",  // VIP 卡「¥1开通」按钮
+                    "dg3",  // VIP 卡「立减」文案
+                    "e4q",  // 我的资产板块（含 提现/金币余额/现金余额/剩余时长）
+                    "ej2",  // 我的页活动横幅（「中秋好礼限时购」等纯图片促销位，只能按 id 删）
             };
             Set<Integer> ids = new HashSet<>();
             for (String n : names) {
@@ -538,17 +704,122 @@ public class MainHook implements IXposedHookLoadPackage {
         // --- 听歌页已知广告位 ---
         hideByResId(act, "a3c", cnt, "听歌页横幅广告");
         hideByResId(act, "fp_", cnt, "听歌页卡片广告");
-        // --- "我的"页面 VIP 宣传广告 与 我的资产 区域 ---
+        // --- "我的"页面：VIP 促销卡 / 我的资产板块 / 快捷入口栏（v1.9.20 按 6.7.1.32 重新定位） ---
         // ⚠️ v1.9.9 重要修复：这里**只能直接隐藏卡片容器本身，禁止向上多级隐藏**。
         //    原实现用 hideByResIdUp("gzy", 3) / ("gjj", 4) 向上找父容器，实测会一路
         //    打到 #e10 和 #c1(com.dragon.read.widget.behavior.CommonCustomAppBarLayout)
         //    —— 那是"我的"页整个顶部 AppBar（头像/昵称/个人主页入口/我的消息 全在里面），
         //    结果整个头部被 GONE：页面顶部出现大片空白、下面的菜单/列表位置明显错乱。
-        //    gzy/gr0 本就是 bpz 的子节点，gjj/gio/gy0 本就是 e33 的子节点，
-        //    父容器 GONE 后子节点自然不可见，无需再向上隐藏。
-        hideByResId(act, "bpz", cnt, "我的页VIP宣传卡片");          // VIP 卡片容器（ConstraintLayout）
-        hideByResId(act, "e33", cnt, "我的资产卡片");                // 我的资产卡片容器（LinearLayout）
-        hideByResId(act, "ccv", cnt, "我的消息卡片");                // 我的消息卡片容器（RelativeLayout，内含 HorizontalScrollView#ccu）
+        hideByResId(act, "br7", cnt, "我的页VIP促销卡片");          // VIP 促销卡容器（6.7.1.32）
+        hideByResId(act, "e4q", cnt, "我的资产板块");                // 我的资产板块容器（提现/金币/现金/剩余时长）
+        // 我的页活动横幅（ej2）：内容是服务端下发的**纯图片**（实测为「中秋好礼限时购 一件立减15%>」），
+        // 图片里带字、节点上没有 text/desc，所以文本规则永远抓不到，只能按容器 id 正面屏蔽。
+        hideByResId(act, "ej2", cnt, "我的页活动横幅");
+        hideMineEntryCard(act, cnt);                                 // 我的页头部入口卡片（我的消息/游戏中心/活动横幅）
+    }
+
+    /**
+     * v1.9.20：「我的」页头部「功能入口 + 活动横幅」卡片（ce4）。
+     *
+     * 该卡片位于「我的」页页头 AppBar 内，只装两样东西：
+     *   ① ce3 —— 横向快捷入口栏（我的消息 / 游戏中心 / 服务端活动入口）；
+     *   ② ej2 —— 活动横幅（实测为「中秋好礼限时购 一件立减15%>」）。
+     *
+     * 为什么单独处理：整卡在 AppBar 内，通用 hideChain 开头的「顶栏整链放弃」保护会直接 return，
+     * 文本规则命中了也什么都不做（运行日志："跳过隐藏(位于顶栏内): '游戏中心'"）。
+     *
+     * 做法：先用 ce4 自身存在与否判定当前确实是「我的」页（其他页面无此 id，避免误伤），
+     * 再把整张卡片 GONE —— 子项全没了，卡片背景与高度也随之消失；
+     * 只藏子项（ce3+ej2）会留下一块 1008x156 的空白圆角底，正是要避免的「大片空白」。
+     * 因为整卡干掉，服务端下发的「带字图片」入口（节点上没有 text/desc）也一并消失。
+     */
+    private void hideMineEntryCard(Activity act, int[] cnt) {
+        try {
+            View decor = act.getWindow().getDecorView();
+            int cardId = act.getResources().getIdentifier("ce4", "id", act.getPackageName());
+            if (cardId <= 0) return;
+            View card = decor.findViewById(cardId);
+            if (card == null || card.getVisibility() == View.GONE) return;   // 不存在 → 当前不是「我的」页
+            card.setVisibility(View.GONE);
+            cnt[0]++;
+            XposedBridge.log("[" + TAG + "] 已隐藏我的页头部入口卡片(ce4): 我的消息/游戏中心/活动横幅");
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * v1.9.20：「我的」页头部需要屏蔽的入口文案。
+     * 只用于「我的」页（见 {@link #isMinePage}），因此可以放心放宽到「含有」匹配。
+     */
+    private boolean isMineHeaderBlockText(String t) {
+        if (t == null || t.length() > 12) return false;
+        if (t.contains("我的消息")) return true;
+        if (t.contains("游戏中心")) return true;
+        // 注意：「我的资产」故意不放这里 —— 它的就近可点击祖先不存在，走浪漫兜底会
+        // 一路爬过入口行/卡片直到页头包装容器（e2n，高 568），把头像/昵称一起吞掉。
+        // 它改为在 hideKnownAdResources 里按精确资源 id（e4q）隐藏。
+        if (t.contains("中秋") || t.contains("好礼")) return true;   // 服务端活动入口（如「中秋好礼」）
+        return false;
+    }
+
+    /**
+     * 当前显示的页面是否「我的」页。
+     *
+     * 判定依据：#e4r（头像+昵称 容器）是「我的」页独有的资源 id（首页/阅读页/听歌页均不存在），
+     * 用它做闸门可以确保 {@link #isMineHeaderBlockText} 的宽匹配不会误伤正文小说文本。
+     */
+    private boolean isMinePage(Activity act) {
+        if (act == null) return false;
+        try {
+            View decor = act.getWindow().getDecorView();
+            if (decor == minePageDecor) return minePageFlag;   // 同一帧内缓存，避免每行文本都 findViewById
+            int id = act.getResources().getIdentifier("e4r", "id", act.getPackageName());
+            boolean isMine = id > 0 && decor.findViewById(id) != null;
+            minePageDecor = decor;
+            minePageFlag = isMine;
+            return isMine;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * 「我的」页头部入口定向隐藏：不走 hideChain（它是空操作），而是就近藏「可点击入口」这张卡片。
+     * 绝不越过 AppBar，避免像 v1.9.9 那样把整条页头 GONE 掉。
+     */
+    private void hideMineHeaderEntry(View v, String t, int[] cnt, Activity act) {
+        try {
+            int sh = 0;
+            try { sh = act != null ? act.getWindow().getDecorView().getHeight() : 0; } catch (Throwable ignored) {}
+            View target = null;
+            View cur = v;
+            // 1) 优先：最近的「可点击入口」祖先（我的消息/游戏中心 入口卡、活动入口卡）
+            //    高度护栏：超过 25% 屏高的可点击容器多半是整块页头/页面容器，不收。
+            for (int i = 0; i < 6 && cur != null; i++) {
+                if (cur != v && cur.isClickable()
+                        && (sh <= 0 || (cur.getHeight() > 0 && cur.getHeight() <= sh * 0.25f))) {
+                    target = cur; break;
+                }
+                View p = cur.getParent() instanceof View ? (View) cur.getParent() : null;
+                if (p == null || isAppBarLike(p)) break;
+                cur = p;
+            }
+            // 2) 兜底：没有可点击入口时，取就近「高度 <= 15% 屏高」的卡片/横幅；
+            //    绝不拿到更大的容器 —— 否则会把整块页头（头像/昵称）一起 GONE 掉。
+            if (target == null) {
+                cur = v;
+                for (int i = 0; i < 6 && cur != null; i++) {
+                    View p = cur.getParent() instanceof View ? (View) cur.getParent() : null;
+                    if (p == null || isAppBarLike(p)) break;
+                    if (sh > 0 && p.getHeight() > 0 && p.getHeight() <= sh * 0.15f) target = p;
+                    cur = p;
+                }
+            }
+            if (target == null || target.getVisibility() == View.GONE) return;
+            target.setVisibility(View.GONE);
+            cnt[0]++;
+            XposedBridge.log("[" + TAG + "] 已隐藏我的页入口['" + t + "'] " + target.getClass().getName()
+                    + " w=" + target.getWidth() + " h=" + target.getHeight());
+        } catch (Throwable ignored) {}
     }
 
     /** 通过资源 ID 找到 View 后，向上隐藏 N 层父容器 */
@@ -802,6 +1073,13 @@ public class MainHook implements IXposedHookLoadPackage {
                     String t = cs.toString().trim();
                     if (t.length() > 0 && t.length() <= 20) {
                         tryAutoSkip(v, t);
+                        // v1.9.20："我的"页头部入口（我的消息/游戏中心/我的资产/活动入口）单独走定向隐藏。
+                        // 这些入口在页头 AppBar 内，通用 hideChain 会因顶栏保护整链放弃（日志："跳过隐藏(位于顶栏内)"），
+                        // 所以必须在 shouldHide 前面拦下来。
+                        if (isMineHeaderBlockText(t) && isMinePage(act)) {
+                            hideMineHeaderEntry(v, t, cnt, act);
+                            return;
+                        }
                         if (shouldHide(t)) {
                             if ((t.contains("看小视频") || (t.contains("免") && t.contains("分钟") && t.contains("广告")))
                                     && act != null) {
@@ -1298,6 +1576,15 @@ public class MainHook implements IXposedHookLoadPackage {
                 "com.dragon.read.ad.feedbanner.widget.BookMallAdFeedPlayTransView",    // 章节完毕过渡视图
                 "com.dragon.read.ad.feedbanner.widget.BookMallAdFeedPlayPage",         // 听书播放页广告
                 "com.dragon.read.ad.feedbanner.widget.BookMallAdFeedCloseView",        // 关闭按钮（兜底）
+                // v1.9.13 新增：阅读页「阅读流一站式广告」(OneStop) 自绘推广卡
+                // （屏幕上那张「XX家具超市 + 反馈」购物卡就是它）。特征：整棵子树没有任何
+                //  resource-id，只有 content-desc 无障碍文案 —— 典型的 Lynx/OneStop 自绘。
+                // 宿主：com.dragon.read.reader.ad.onestop.view.ReadFlowOneStopAdLine
+                // （内部持有 cj1/c.e() 返回的 ReadFlowOneStopAtAdView）。
+                // ⚠️ 它既不过 AdLynxHelper.checkIfRitAvailable，也不过 AdConfigManager.checkAdAvailable，
+                //    所以之前两个「源头总闸」都拦不到，只能按 View 类名视觉隐藏。
+                "com.bytedance.tomato.onestop.readerad.ui.ReadFlowOneStopAtAdView",
+                "com.bytedance.tomato.onestop.readerad.ui.ReadFlowOneStopNonRoundEntranceLayout",
         };
         // 用全限定类名 HashSet 加速 addView 拦截
         final Set<String> adFullNames = new HashSet<>();
@@ -1329,6 +1616,14 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (adFullNames.contains(fullClsName)) {
                             child.setVisibility(View.GONE);
                             XposedBridge.log("[" + TAG + "] 已拦截广告View(addView时GONE): " + fullClsName);
+                            return;
+                        }
+                        // v1.9.11 新增：按已知广告资源 ID 预拦截，消除首帧闪现。
+                        // 资源 ID 在 XML inflate 时已通过 setId() 设置，addView 前已可用。
+                        int cid = child.getId();
+                        if (cid != View.NO_ID && PRE_HIDE_RES_IDS.contains(cid)) {
+                            child.setVisibility(View.GONE);
+                            XposedBridge.log("[" + TAG + "] 已拦截广告View(addView时GONE by resId): 0x" + Integer.toHexString(cid));
                         }
                     } catch (Throwable ignored) {}
                 }
@@ -1438,6 +1733,9 @@ public class MainHook implements IXposedHookLoadPackage {
                         hookAdSignals();
                         hookKnownAdViews();
                         hookMusicPatchAd();   // v1.9.9：SDK 类可能延迟加载，重试注册
+                        hookLynxAdBlocker();  // v1.9.12：AdLynxHelper 可能延迟加载，重试注册
+                        hookReaderAdLineFactory(); // v1.9.18：类可能延迟加载，重试注册
+                        hookVipPromotionPopup();   // v1.9.19：类可能延迟加载，重试注册
                     } catch (Throwable t) {
                         XposedBridge.log("[" + TAG + "] 延迟广告 hook 失败: " + t);
                     }
@@ -1528,6 +1826,328 @@ public class MainHook implements IXposedHookLoadPackage {
                 adHookReport.append("FreeAdConversionDialog✓ ");
             }
         } catch (Throwable ignored) {}
+    }
+
+    /**
+     * v1.9.11 新增：广告位总闸 —— 从**源头**掐断被动展示型广告。
+     *
+     * <p>为什么加这个：此前的去广告全靠「View 树层面隐藏」——等广告 View 被创建出来、
+     * 挂到界面上之后才把它 GONE 掉。这套做法有三个先天缺陷：
+     * <ol>
+     *   <li><b>首帧闪现</b>：广告 View 已经渲染过一帧才被隐藏，用户能看见闪一下
+     *       （首页搜索栏上方那个「全天畅听 / 领金币」块就是这个症状）；</li>
+     *   <li><b>要逐个跟</b>：每换一个广告位就得重新定位 View / 资源 id，番茄一改版就失效；</li>
+     *   <li><b>拦不住自绘广告</b>：Lynx 模板广告（贴片广告）根本不在 View 树里，只能靠视觉兜底。</li>
+     * </ol>
+     *
+     * <p>同类项目 FanqieHook（dev.operit.fanqiehook）用的是**源码级广告位总闸**：
+     * hook 广告配置管理器的 {@code checkAdAvailable(position, source)}，按「广告位字符串」
+     * 直接返回 false。这是所有广告位的统一入口，一次 hook 覆盖全部，且**在广告请求/渲染之前**
+     * 就返回了，天然没有首帧闪现问题。
+     *
+     * <p>本模块在畅听 6.7.1.16 上定位到的对应方法（反汇编 classes14.dex 确认）：
+     * <pre>
+     *   com.dragon.read.base.ad.AdConfigManager.checkAdAvailable(String, String) : boolean
+     * </pre>
+     * 注意：<b>不能照搬对方的类名</b> —— 对方 hook 的
+     * {@code com.dragon.read.component.biz.impl.NsAdImpl} 在畅听里**不存在**
+     * （畅听与小说的 dragon 基线版本不同）。
+     *
+     * <p>策略：只拦 {@link #BLOCKED_AD_POSITIONS} 里的「被动展示位」，
+     * 用户主动触发的激励视频 / 金币 / 看广告免广告流程一律放行（返回原值）。
+     * 同时把所有出现过的广告位打一条日志，方便换版本后重新收集。
+     */
+    private void hookAdConfigGate() {
+        if (adConfigGateHooked) return;
+        adConfigGateHooked = true;
+
+        Class<?> cls = null;
+        try {
+            cls = XposedHelpers.findClassIfExists(AD_CONFIG_MANAGER_CLS, appCl);
+        } catch (Throwable ignored) {}
+        if (cls == null) {
+            XposedBridge.log("[" + TAG + "] 广告位总闸: " + AD_CONFIG_MANAGER_CLS
+                    + " 未找到，跳过（不影响其他拦截）");
+            return;
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(cls, "checkAdAvailable", String.class, String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                String position = param.args[0] == null ? "" : String.valueOf(param.args[0]);
+                                String source = (param.args.length > 1 && param.args[1] != null)
+                                        ? String.valueOf(param.args[1]) : "";
+
+                                // 收集：所有出现过的广告位各打一次，便于换版本后重新确定黑名单
+                                if (seenAdPositions.add(position)) {
+                                    XposedBridge.log("[" + TAG + "] 广告位出现: " + position
+                                            + " | source=" + source);
+                                }
+
+                                if (BLOCKED_AD_POSITIONS.contains(position)) {
+                                    param.setResult(Boolean.FALSE);
+                                    if (blockedAdPositions.add(position)) {
+                                        XposedBridge.log("[" + TAG + "] 🚫 已从源头拦截广告位: "
+                                                + position + " | source=" + source);
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            XposedBridge.log("[" + TAG + "] ✅ 广告位总闸已挂载: "
+                    + "AdConfigManager.checkAdAvailable(String,String)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] 广告位总闸挂载失败: " + t);
+        }
+    }
+
+    /**
+     * v1.9.12 新增：从源头拦截阅读页 Lynx 广告（见 {@link #BLOCKED_LYNX_AD_SCENES}）。
+     *
+     * <p>hook 两处：
+     * <ol>
+     *   <li>{@code AdLynxHelper.checkIfRitAvailable(scene, rit)} —— 命中黑名单场景键时
+     *       直接返回 {@code "ad_available_check_rit_disenable"}，让 App 走它自己的
+     *       「rit 校验不通过」失败分支（requestAd 里会 onRequestFailed），广告请求前即中止；</li>
+     *   <li>{@code AdLynxHelper.requestAd(scene, ...)} —— 只打日志，用于换版本后重新收集
+     *       Lynx 场景键（每个新场景只打一次）。</li>
+     * </ol>
+     */
+    private void hookLynxAdBlocker() {
+        if (lynxAdHookDone) return;
+        Class<?> helper = null;
+        try {
+            helper = XposedHelpers.findClassIfExists("com.dragon.read.lynx.AdLynxHelper", appCl);
+        } catch (Throwable ignored) {}
+        if (helper == null) {
+            // 不置位：AdLynxHelper 可能延迟加载，留给 scheduleAdSignalRetry 重试
+            XposedBridge.log("[" + TAG + "] Lynx 广告拦截: AdLynxHelper 未找到，稍后重试");
+            return;
+        }
+        lynxAdHookDone = true;
+        // ① 拦截点：checkIfRitAvailable(scene, rit) -> "ad_available_check_rit_disenable"
+        try {
+            XposedBridge.hookAllMethods(helper, "checkIfRitAvailable", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        String scene = (param.args != null && param.args.length > 0 && param.args[0] != null)
+                                ? String.valueOf(param.args[0]) : "";
+                        if (BLOCKED_LYNX_AD_SCENES.contains(scene)) {
+                            param.setResult("ad_available_check_rit_disenable");
+                            XposedBridge.log("[" + TAG + "] 🚫 已从源头拦截 Lynx 广告场景: " + scene);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            XposedBridge.log("[" + TAG + "] ✅ Lynx 广告场景拦截器已挂载: "
+                    + "AdLynxHelper.checkIfRitAvailable");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] Lynx 场景拦截挂载失败: " + t);
+        }
+        // ② 侦察：收集所有出现过的 Lynx 广告场景键（每场景一次），换版本后据此更新黑名单
+        try {
+            XposedBridge.hookAllMethods(helper, "requestAd", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        String scene = (param.args != null && param.args.length > 0 && param.args[0] != null)
+                                ? String.valueOf(param.args[0]) : "";
+                        if (scene.length() > 0 && seenLynxScenes.add(scene)) {
+                            XposedBridge.log("[" + TAG + "] Lynx 广告场景出现: " + scene);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * v1.9.14 新增：从源头关闭阅读页 OneStop 一站式广告（屏幕上的「XX家具超市 + 反馈」购物卡）。
+     *
+     * <p>v1.9.13 已经把广告 View（{@code ReadFlowOneStopAtAdView}）构造即 GONE，广告确实看不到了，
+     * 但**广告位 Reserved 的空间还在，正文不会自动上提**，留下一大片空白。根因是：广告 View
+     * 只是被隐藏，而阅读器已经把这条「广告行」的占位高度算进了排版。
+     *
+     * <p>正确做法是从源头让它根本不展示 —— 反汇编 classes13.dex 确认两个策略类各有一个
+     * {@code a(Lca/a;)Z} 方法，返回值就是“能否展示/能否请求”：
+     * <pre>
+     *   ReadFlowOneStopAdDisplayStrategy.a(Lca/a;)Z    // true=展示策略通过，false=不展示
+     *   ReadFlowOneStopAdRequestStrategy.a(Lca/a;)Z    // true=可发起请求
+     *   （vm 里：v1 初始=0，末尾仅当校验全通过时 const/4 v1,#1 再 return）
+     * </pre>
+     * 把这两个方法直接短路成 false，广告既不会被请求、也不会被展示，
+     * 阅读器自然不会给它留占位，正文连贯、没有空白。
+     *
+     * <p>用反射筛选签名（只改 {@code a(...)} 且返回 boolean 的重载），不硬编码参数类型，
+     * 换版本后即使参数类型变了也能命中。
+     */
+    private void hookOneStopReaderAd() {
+        hookOneStopStrategy("com.bytedance.tomato.onestop.readerad.strategy.ReadFlowOneStopAdDisplayStrategy", "展示");
+        hookOneStopStrategy("com.bytedance.tomato.onestop.readerad.strategy.ReadFlowOneStopAdRequestStrategy", "请求");
+    }
+
+    /**
+     * v1.9.18 新增：从源头屏蔽阅读页「章节末」广告入口行
+     * （屏幕上那个「看小视频免30分钟广告」小卡片，以及同批次的买VIP入口/加桌面快捷方式行）。
+     *
+     * <p>为什么之前的隐藏拦不住：这些入口不是普通弹窗，而是阅读器 drawlevel 体系里的一个
+     * “Line”。每次翻页/重排，阅读器都会重新 constructing 并把它插进页面，
+     * 所以“文末 GONE 一下”只能隐藏一帧，下一帧又重新出现 —— 必须从“生成入口”这一步堵住。
+     *
+     * <p>反汇编 6.7.1.32 定位到（classes14.dex）：
+     * <pre>
+     *   Lf22/q;->a(...)Lcom/dragon/read/ad/AddShortcutLine;   // 加桌面快捷方式行
+     *   Lf22/q;->b(...)Lcom/dragon/read/ad/ButtonLine;         // 章节末广告按钮行（「看小视频免30分钟广告」）
+     *   Lf22/q;->c(...)Lcom/dragon/read/ad/BuyVipEntranceLine; // 章节末买VIP入口行
+     * </pre>
+     * 用 tools/findcallers.py 确认：三个方法**只**被阅读页广告行 provider
+     * {@code r23.d.a(tc3/c)} 调用，且调用点全部是 {@code if-nez v0, -> 0x01eb} 判空跳转 ——
+     * 因此让它们返回 null，App 会自己跳过「添加该行」，既干净又不会报错。
+     *
+     * <p>只屏蔽这三个广告入口行工厂，不动其他阅读器 Line，正文排版不受影响、也不会留空白。
+     */
+    private void hookReaderAdLineFactory() {
+        if (readerAdLineHooked) return;
+        Class<?> q = null;
+        try {
+            q = XposedHelpers.findClassIfExists("f22.q", appCl);
+        } catch (Throwable ignored) {}
+        if (q == null) {
+            XposedBridge.log("[" + TAG + "] 阅读页广告行工厂 f22.q 未找到，稍后重试");
+            return;
+        }
+        readerAdLineHooked = true;
+        final String[] methods = {"a", "b", "c"};
+        for (final String m : methods) {
+            try {
+                XposedBridge.hookAllMethods(q, m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            java.lang.reflect.Member mem = param.method;
+                            if (!(mem instanceof java.lang.reflect.Method)) return;
+                            Class<?> rt = ((java.lang.reflect.Method) mem).getReturnType();
+                            if (rt == null || !rt.getName().startsWith("com.dragon.read.ad.")) return;
+                            param.setResult(null);
+                            if (readerAdLineBlocked.add(m + ":" + rt.getSimpleName())) {
+                                XposedBridge.log("[" + TAG + "] 🚫 已从源头屏蔽阅读页广告入口行: f22.q."
+                                        + m + "() -> " + rt.getSimpleName());
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                });
+            } catch (Throwable ignored) {}
+        }
+        XposedBridge.log("[" + TAG + "] ✅ 阅读页广告入口行工厂拦截已挂载: f22.q.a/b/c");
+    }
+
+    /**
+     * v1.9.19 新增：从源头屏蔽首页「VIP 促销全屏弹层」
+     * （屏幕上那整屏的「仅限当前设备开通7天会员，限时有效」浮层；整层无 resource-id、
+     * 只有 content-desc，是 Lynx 自绘的促销页）。
+     *
+     * <p>反汇编 classes14.dex 定位到它的原生入口（H5/Lynx 通过 JSBridge 调过来）：
+     * <pre>
+     *   Lcom/dragon/read/hybrid/bridge/modules/vip/a;
+     *     showVipPromotionPopup(IBridgeContext, String, Z, I, I)V
+     * </pre>
+     * 方法体内 {@code new a13.d0(ctx)} 并最后调 {@code com.dragon.read.widget.dialog.i.show()}
+     * 把整屏促销弹层展示出来（a13.d0 继承 com.dragon.read.widget.dialog.i）。
+     *
+     * <p>拦截策略（两层）：
+     * <ol>
+     *   <li>把 {@code showVipPromotionPopup} 整个短路（该方法返回 void、正常展示分支也
+     *       不回调 JS，短路不会造成页面卡死）；</li>
+     *   <li>兜底：即使从别的路径直接 {@code a13.d0.show()}，也把该类的 show 压掉。</li>
+     * </ol>
+     */
+    private void hookVipPromotionPopup() {
+        if (vipPromoHooked) return;
+        boolean any = false;
+        // ① 入口：bridge 方法短路
+        try {
+            Class<?> a = XposedHelpers.findClassIfExists(
+                    "com.dragon.read.hybrid.bridge.modules.vip.a", appCl);
+            if (a != null) {
+                XposedBridge.hookAllMethods(a, "showVipPromotionPopup", new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        param.setResult(null);
+                        XposedBridge.log("[" + TAG + "] 🚫 已从源头拦截首页VIP促销全屏弹层: showVipPromotionPopup");
+                    }
+                });
+                any = true;
+            }
+        } catch (Throwable ignored) {}
+        // ② 兜底：促销弹层类 a13.d0 直接 show 时压掉
+        try {
+            Class<?> dlgBase = XposedHelpers.findClassIfExists(
+                    "com.dragon.read.widget.dialog.i", appCl);
+            if (dlgBase != null) {
+                XposedBridge.hookAllMethods(dlgBase, "show", new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (param.thisObject != null
+                                    && "a13.d0".equals(param.thisObject.getClass().getName())) {
+                                param.setResult(null);
+                                XposedBridge.log("[" + TAG + "] 🚫 已拦截VIP促销弹层 show(): a13.d0");
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                });
+                any = true;
+            }
+        } catch (Throwable ignored) {}
+        if (any) {
+            vipPromoHooked = true;
+            XposedBridge.log("[" + TAG + "] ✅ 首页VIP促销弹层拦截已挂载");
+        }
+    }
+
+    private void hookOneStopStrategy(final String clsName, final String label) {
+        Class<?> cls = null;
+        try {
+            cls = XposedHelpers.findClassIfExists(clsName, appCl);
+        } catch (Throwable ignored) {}
+        if (cls == null) {
+            XposedBridge.log("[" + TAG + "] OneStop 读取页广告策略未找到: " + clsName);
+            return;
+        }
+        // 诊断：打出方法表，便于换版本后核对策略方法签名
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
+                sb.append(m.getName()).append(java.util.Arrays.toString(m.getParameterTypes()))
+                        .append("->").append(m.getReturnType().getSimpleName()).append("; ");
+            }
+            XposedBridge.log("[" + TAG + "] OneStop策略方法表(" + label + "): " + sb);
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] OneStop策略方法表读取失败(" + label + "): " + t);
+        }
+        // 拦截：hookAllMethods 会对所有名为 a 的方法挂 hook（含静态/重载），
+        // 在调用时按「返回 boolean 且只有一个参数」筛选，不依赖反射签名硬匹配。
+        try {
+            XposedBridge.hookAllMethods(cls, "a", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        java.lang.reflect.Member member = param.method;
+                        if (!(member instanceof java.lang.reflect.Method)) return;
+                        java.lang.reflect.Method mm = (java.lang.reflect.Method) member;
+                        if (mm.getReturnType() != boolean.class) return;
+                        if (param.args == null || param.args.length != 1) return;
+                        param.setResult(Boolean.FALSE);
+                        // 该策略每次翻页都会被调用，日志只打一次，避免刷屏
+                        if (oneStopBlockedLogged.add(label + ":" + mm.getName())) {
+                            XposedBridge.log("[" + TAG + "] 🚫 已拦截阅读页 OneStop 广告策略(" + label + "): "
+                                    + mm.getName() + java.util.Arrays.toString(mm.getParameterTypes()));
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            XposedBridge.log("[" + TAG + "] ✅ OneStop 阅读页广告策略已挂载(" + label + "): " + clsName);
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] OneStop 策略 hook 异常(" + label + "): " + t);
+        }
     }
 
     /**

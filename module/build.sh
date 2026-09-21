@@ -39,7 +39,7 @@ $TOOL/bin/aapt2 link -o out/module-unsigned.apk \
   -I $ANDROID_JAR \
   --manifest AndroidManifest.xml \
   --min-sdk-version 26 --target-sdk-version 34 \
-  --version-code 19600 --version-name 1.9.5-adfix
+  --version-code 192000 --version-name 1.9.20
 
 echo "== [5/6] 加入 classes.dex 与 xposed_init =="
 mkdir -p assets

@@ -1,6 +1,33 @@
 # 更新日志
 
 所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+## [v1.9.11 ~ v1.9.20] - 2026-09-21
+
+### 适配
+- **番茄畅听 `6.7.1.32`（versionCode `671`）实测通过**（上一适配版本 `6.7.1.16`）
+  - 两版 `versionCode` 相同 ⇒ 混淆「名字表」未变（`gxi`/`bwf`/`gtr`/`f22.q` 等名字依然存在），但**资源 id 数值整体平移**：`PRE_HIDE_RES_IDS` 已按新包重新提取（`gxi`→`0x7f102989`、`a3c`→`0x7f1004c5`、`fp_`→`0x7f1022e9` 等）
+  - 「我的」页换成了一组新 id：`bpz`→`br7`（VIP 促销卡）、`e33`→`e4q`（我的资产板块）、`ccv`→`ce3`/`ce4`（快捷入口栏 / 头部入口卡片）
+  - 结论写进 README：**不能因为 versionCode 没变就认为不用适配**
+- 新增 `module/build_local.sh`：**宿主机本地构建**（JDK + Gradle 缓存里的 `android.jar`/`apksig`/`bouncycastle` + `r8.jar`），替换 `classes.dex` 后用同一 keystore 重签 v1+v2，**不再依赖手机 root 与 Termux 工具链**
+
+### 新增（拦截）
+- **阅读页正文流「一站式购物卡」（v1.9.14）**：如「XX家具超市 + 反馈」，是字节 OneStop（Lynx）自绘，整棵子树无 resource-id、也不经过 `AdConfigManager` / `AdLynxHelper`，旧规则全部漏过。改为短路 `ReadFlowOneStopAdDisplayStrategy.a()` 与 `ReadFlowOneStopAdRequestStrategy.a()` → 广告在**请求之前**就被否掉，阅读器不再给广告行留占位（**连空白一起消失**）
+- **章节末「看小视频免30分钟广告」入口行（v1.9.18）**：文案来自布局字符串资源、阅读器每次翻页都会重建，靠「文末 GONE 一下」拦不住。逆向定位到工厂 `f22.q.a()`/`b()`/`c()`（`AddShortcutLine` / `ButtonLine` / `BuyVipEntranceLine`），三者只被阅读页广告行 provider `r23.d.a` 调用且调用点均判空 → 让工厂返回 `null`，App 自行跳过「添加该行」，不报错也不留空白
+- **首页「VIP 促销全屏浮层」（v1.9.19）**：H5/Lynx 经 JSBridge 调 `com.dragon.read.hybrid.bridge.modules.vip.a.showVipPromotionPopup()` 弹出整屏促销层，其 Dialog 类名 `a13.d0` 是纯混淆名、命中不了原有类名白名单 → 短路该 bridge 方法 + 对促销 Dialog `show()` 兜底
+- **广告位总闸（v1.9.11）**：hook `AdConfigManager.checkAdAvailable(广告位, 类型)`，被动展示型广告位直接返回 false；并 hook `AdLynxHelper.checkIfRitAvailable` 覆盖 Lynx 场景键（含 `reader_lynx_video_ad`）
+- **「我的」页四类入口（v1.9.20）**：我的消息 / 游戏中心（快捷入口栏 `ce3` 内的 `u2` 入口卡）、我的资产板块（`e4q`，含提现 / 金币余额 / 现金余额 / 剩余时长）、活动横幅（`ej2`，实测「中秋好礼限时购 · 一件立减15%>」）
+
+### 修复
+- **「我的」页头部入口「文本命中却不隐藏」**：这些入口都在页头 AppBar 内，`hideChain()` 开头的 `isAppBarLike` 整链放弃保护会直接 return（日志：`跳过隐藏(位于顶栏内): '游戏中心'`）。新增 `hideMineHeaderEntry()`：绕过顶栏保护，但只就近隐藏「可点击入口卡」，并加 25% 屏高护栏
+- **避免「整块页头消失」回归**：「我的资产」不再走文本兜底（那条路会一路爬到页头包装容器 `e2n`，把头像 / 昵称 / 个人主页一起吞掉，页面顶部留大片空白），改为按精确资源 id `e4q` 隐藏
+- **只藏子项会留下空槽**：`ce3`（入口栏）+ `ej2`（横幅）都藏掉后，`ce4` 卡片背景仍占 1008×156 → 改为整张 `ce4` GONE，高度随之收起
+- **横幅是纯图片、文本规则抓不到**：`ej2` 内的「中秋好礼限时购」是画进图片里的字，节点上既无 text 也无 content-desc，只能按容器 id 屏蔽
+- `XC_MethodHook.MethodHookParam` 补上 `method` 字段（Xposed stub 缺失，导致诊断代码无法编译）
+
+### 文档
+- README：适配版本表 / 历史表更新到 `6.7.1.32`；新增「🛠 构建」章节；功能列表与工作原理表补齐 v1.9.11~v1.9.20 的拦截项
+- 新增 `RELEASE_NOTES_v1.9.20.md`
+
 
 ## [v1.9.5] - 2026-08-28
 

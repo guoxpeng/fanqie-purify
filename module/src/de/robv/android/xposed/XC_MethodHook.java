@@ -7,6 +7,7 @@ import java.lang.reflect.Method;
  */
 public class XC_MethodHook {
     public static class MethodHookParam {
+        public java.lang.reflect.Member method;
         public Object thisObject;
         public Object[] args;
 
