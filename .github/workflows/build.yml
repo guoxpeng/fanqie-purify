@@ -123,7 +123,7 @@ jobs:
           if-no-files-found: error
 
       - name: 发布到主仓库 Releases
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -146,13 +146,17 @@ jobs:
               $TARGET --generate-notes
           fi
 
+      # 注意：不能用 secrets 做 step 级 if（GitHub 会报 Unrecognized named-value: 'secrets'），
+      #       所以这里用 if 判 ref、在脚本里判 secret 是否为空。
       - name: 同步模块发布仓库（Vector / LSPosed）
-        if: |
-          steps.ks.outputs.official == 'true' && secrets.RELEASE_REPO_TOKEN != '' &&
-          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        if: steps.ks.outputs.official == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::未配置 RELEASE_REPO_TOKEN，跳过同步发布仓库"
+            exit 0
+          fi
           APK="${{ steps.ver.outputs.apk }}"
           VER="${{ steps.ver.outputs.versionName }}"
           TAG="${{ steps.ver.outputs.tag }}"
