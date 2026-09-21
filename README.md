@@ -119,9 +119,9 @@
 
 ## 🛠 构建
 
-两套构建方式，**推荐用宿主机本地构建**（不需要手机 root，当前维护者用的就是它）：
+三套构建方式，**日常出包直接推 GitHub 就行**（方式三全自动，不需要本机装任何工具链）：
 
-### 方式一：宿主机本地构建（推荐）
+### 方式一：宿主机本地构建（方式三在 CI 上跑的就是它）
 
 ```bash
 bash module/build_local.sh        # 产物：module-local.apk，可直接 adb install -r
@@ -132,9 +132,28 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 - **可覆盖的环境变量**：`ANDROID_JAR` / `R8_JAR` / `APKSIG_JAR` / `BCPROV_JAR` / `BCPKIX_JAR` / `TEMPLATE_APK`（上一版模块 APK，须与本机安装的是同一签名）/ `KEYSTORE` / `WORK`
 - 仓库里附带的 `fanqie-enhance-*.apk` 既是成品，也是下一次构建的 `TEMPLATE_APK`
 
-### 方式二：手机端 Termux 工具链
+### 方式二：手机端 Termux 工具链（仅作备用）
 
 `module/build.sh` 依赖手机上的 `/data/local/tmp/fuck_andes/tool/TERMUX`（`root:root 700`，必须 root 才能用）。换应用版本做适配时它更方便 —— 可以直接在手机上 `aapt2 dump resources` 提取新包的资源 id。
+
+### 方式三：GitHub Actions 自动打包 / 自动发布
+
+工作流在 [`.github/workflows/build.yml`](.github/workflows/build.yml)，**push 到 `main` 即自动完成全部动作**：
+
+1. 装 JDK 21 → 取 `android.jar`（优先用 runner 自带的 Android SDK，取不到才下官方 platform 包）→ 拉 `r8`/`apksig`/`bouncycastle`
+2. 调用 `module/build_local.sh` 出包（用仓库里当前这版 APK 当模板，签名密钥从 secret 注入）
+3. 校验产物（包内有 `classes.dex` / `AndroidManifest.xml`）→ 上传 workflow artifact
+4. tag 为 `{versionCode}-{versionName}`：**Release 不存在就建，存在就覆盖资产**，同时同步
+   [`Xposed-Modules-Repo/com.eta.fanqie.enhance`](https://github.com/Xposed-Modules-Repo/com.eta.fanqie.enhance)（Vector / LSPosed 读取的发布仓库）
+
+所以**升版本只要改 `module/AndroidManifest.xml` 里的 `versionCode`/`versionName` 然后 push**，Release 与发布仓库会自动跟上；只改文档也会重新构建并把同一版本号的 Release 资产刷新成最新构建。
+
+需要的仓库 secrets（Settings → Secrets and variables → Actions，已配置）：
+
+| Secret | 作用 | 缺失时 |
+|---|---|---|
+| `MODULE_KEYSTORE_BASE64` | 模块签名 keystore（`module.keystore`）的 base64 | 用临时密钥签名 → 产物**不能覆盖安装**，且跳过 Release 发布 |
+| `RELEASE_REPO_TOKEN` | 对发布仓库有写权限的 PAT | 跳过发布仓库同步 |
 
 > 本模块的版本号（`1.9.x`）与番茄的版本号（`6.7.1.32`）是**两套独立编号**，不要混淆。
 
@@ -179,6 +198,7 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 ├── CHANGELOG.md                 ← 版本历史
 ├── RELEASE_NOTES_v1.9.20.md     ← 最新版发布说明（含适配版本 + 逐项拦截清单）
 ├── RELEASE_NOTES_v1.9.10.md     ← 历史版本发布说明
+├── .github/workflows/build.yml  ← push 即自动打包 + 发布 Release
 └── module/
     ├── src/                     ← Java 源码（MainHook.java + Xposed stub）
     ├── build.sh                 ← 手机端构建脚本（Termux 工具链，需 root）

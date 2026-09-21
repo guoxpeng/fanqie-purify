@@ -1,6 +1,17 @@
 # 更新日志
 
 所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+## [CI] 自动打包 / 自动发布 - 2026-09-21
+
+### 新增
+- `.github/workflows/build.yml`：push 到 `main` 即自动构建模块 APK → 上传 workflow artifact → 维护 `{versionCode}-{versionName}` Release（不存在则建、存在则覆盖资产）→ 同步 [Xposed-Modules-Repo/com.eta.fanqie.enhance](https://github.com/Xposed-Modules-Repo/com.eta.fanqie.enhance) 发布仓库
+- 仓库 secrets：`MODULE_KEYSTORE_BASE64`（官方签名密钥，产物可直接覆盖安装）、`RELEASE_REPO_TOKEN`（发布仓库写入）
+
+### 修复
+- **工作流此前每次都卡在「准备 android.jar」**：runner 从 `dl.google.com` 拿到的是非 zip 的错误页，`unzip` 直接失败、后面步骤全部跳过 —— 这就是 Release 一直停在旧版本的原因之一。改为优先用 runner 预装的 `android-34` SDK（零下载），下载兜底路径加 `unzip -t` 校验
+- **没有签名密钥导致永远不发布**：`MODULE_KEYSTORE_BASE64` 未配置时工作流只能用临时密钥签名并跳过 Release。现已配置，`gh release create` 在 tag 已存在时会退回 `--verify-tag` 重试
+
 ## [v1.9.11 ~ v1.9.20] - 2026-09-21
 
 ### 适配
