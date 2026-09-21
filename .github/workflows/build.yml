@@ -2,17 +2,17 @@ name: 自动打包 / 发布
 
 # 自动化目标：改完代码只 push 一次，剩下的全自动。
 #   push 到 main  → 构建模块 APK（用仓库里上一版 APK 当资源模板 + 重签）→ 上传 workflow artifact
-#                    → 若版本号比最近的 Release 新，自动建 tag「{versionCode}-{versionName}」并发布 Release
+#                    → 若对应的 Release 不存在就建 tag「{versionCode}-{versionName}」并发布，存在就覆盖资产
 #   push tag      → 同上，Release 用该 tag
 #   手动触发      → 只构建 + 上传 artifact（不发布）
 #
-# 需要的 secrets（都在 Settings → Secrets and variables → Actions 里加）：
+# 需要的 secrets（Settings → Secrets and variables → Actions）：
 #   MODULE_KEYSTORE_BASE64  模块签名 keystore（/data/local/tmp/fuck_andes/module/module.keystore）的 base64
-#                           ★ 没有它也能构建，但产物只能用临时密钥签名、不能覆盖安装，也不会发布 Release
+#                           ★ 没有它构建出来的包用临时密钥签名、不能覆盖安装，也会跳过 Release 发布
 #   RELEASE_REPO_TOKEN      对 Xposed-Modules-Repo/com.eta.fanqie.enhance 有写权限的 PAT（可选）
 #                           配了就会同步发布仓库的文件并建对应的 Release
 #
-# 生成 base64：  base64 -w0 module.keystore    (Windows: certutil -encodehex ... 或 git-bash 的 base64)
+# 生成 base64：  base64 -w0 module.keystore    (Windows: git-bash 里同上)
 
 on:
   push:
@@ -25,7 +25,8 @@ permissions:
   contents: write
 
 env:
-  ANDROID_PLATFORM: android-34
+  # 只兜底用：优先拿 runner 自带的 Android SDK，取不到才下这个官方 platform 包
+  ANDROID_PLATFORM_ZIP: platform-34-ext7_r03.zip
   RELEASE_REPO: Xposed-Modules-Repo/com.eta.fanqie.enhance
 
 jobs:
@@ -43,29 +44,47 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # 不用 android-actions/setup-android：它依赖 runner 预装的 cmdline-tools，曾经直接失败；
-      # 这里直接从 dl.google.com 拉官方 platform 包，只要里面那个 android.jar，确定性更好。
+      # 只要一个 android.jar 给 javac / d8 当编译目标。
+      # ubuntu runner 镜像自带 Android SDK（含 android-34），所以优先直接用现成的，零下载最稳；
+      # 取不到才去 dl.google.com 拉官方 platform 包 —— 注意 Google 偶尔会返回非 zip 的错误页，
+      # 所以这里先 unzip -t 校验，避免又出现 "End-of-central-directory signature not found"。
       - name: 准备 android.jar（javac / d8 的编译目标）
         run: |
-          curl -sSL --retry 3 -o platform.zip \
-            https://dl.google.com/android/repository/platform-${ANDROID_PLATFORM}-ext7_r03.zip
-          unzip -o -q platform.zip "*/android.jar" -d plat
-          AJ="$(find plat -name android.jar | head -1)"
-          echo "ANDROID_JAR=$PWD/$AJ" >> "$GITHUB_ENV"
-          ls -la "$PWD/$AJ"
+          set -euo pipefail
+          AJ=""
+          for base in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
+            [ -n "$base" ] || continue
+            if [ -s "$base/platforms/android-34/android.jar" ]; then
+              AJ="$base/platforms/android-34/android.jar"
+              break
+            fi
+          done
+          if [ -z "$AJ" ]; then
+            echo "runner 没有预装 android-34，改为下载官方 platform 包"
+            curl -fsSL --retry 3 -o platform.zip \
+              "https://dl.google.com/android/repository/${ANDROID_PLATFORM_ZIP}"
+            unzip -tq platform.zip > /dev/null
+            unzip -o -q platform.zip "*/android.jar" -d plat
+            AJ="$PWD/$(find plat -name android.jar | head -1)"
+          fi
+          test -s "$AJ"
+          echo "ANDROID_JAR=$AJ" >> "$GITHUB_ENV"
+          ls -la "$AJ"
 
       - name: 下载构建依赖（r8 / apksig / bouncycastle）
         run: |
+          set -euo pipefail
           mkdir -p deps
-          curl -sSLo deps/r8.jar     https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.5.35/r8-8.5.35.jar
-          curl -sSLo deps/apksig.jar https://dl.google.com/dl/android/maven2/com/android/tools/build/apksig/8.5.2/apksig-8.5.2.jar
-          curl -sSLo deps/bcprov.jar https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.79/bcprov-jdk18on-1.79.jar
-          curl -sSLo deps/bcpkix.jar https://repo1.maven.org/maven2/org/bouncycastle/bcpkix-jdk18on/1.79/bcpkix-jdk18on-1.79.jar
+          curl -fsSLo deps/r8.jar     https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.5.35/r8-8.5.35.jar
+          curl -fsSLo deps/apksig.jar https://dl.google.com/dl/android/maven2/com/android/tools/build/apksig/8.5.2/apksig-8.5.2.jar
+          curl -fsSLo deps/bcprov.jar https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.79/bcprov-jdk18on-1.79.jar
+          curl -fsSLo deps/bcpkix.jar https://repo1.maven.org/maven2/org/bouncycastle/bcpkix-jdk18on/1.79/bcpkix-jdk18on-1.79.jar
           ls -la deps
 
       - name: 读取版本号 / 计算 tag
         id: ver
         run: |
+          set -euo pipefail
           VN=$(python3 -c "import re;print(re.search(r'versionName=\"([^\"]+)\"',open('module/AndroidManifest.xml',encoding='utf-8').read()).group(1))")
           VC=$(python3 -c "import re;print(re.search(r'versionCode=\"(\d+)\"',open('module/AndroidManifest.xml',encoding='utf-8').read()).group(1))")
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG="${GITHUB_REF_NAME}"; else TAG="${VC}-${VN}"; fi
@@ -78,9 +97,11 @@ jobs:
       - name: 准备签名密钥
         id: ks
         run: |
+          set -euo pipefail
           KS="$RUNNER_TEMP/module.keystore"
           if [ -n "${{ secrets.MODULE_KEYSTORE_BASE64 }}" ]; then
             printf '%s' "${{ secrets.MODULE_KEYSTORE_BASE64 }}" | base64 -d > "$KS"
+            test -s "$KS"
             echo "official=true" >> "$GITHUB_OUTPUT"
             echo "✅ 使用仓库密钥签名（产物可直接覆盖安装）"
           else
@@ -93,6 +114,7 @@ jobs:
 
       - name: 构建模块 APK
         run: |
+          set -euo pipefail
           export WORK="$RUNNER_TEMP/build"
           export OUT_DIR="$PWD"
           export R8_JAR="$PWD/deps/r8.jar"
@@ -107,11 +129,11 @@ jobs:
 
       - name: 校验 APK（包内清单 / dex 存在）
         run: |
+          set -euo pipefail
           APK="${{ steps.ver.outputs.apk }}"
           unzip -l "$APK" | tee /tmp/apklist.txt
           grep -q "classes.dex" /tmp/apklist.txt
           grep -q "AndroidManifest.xml" /tmp/apklist.txt
-          unzip -p "$APK" AndroidManifest.xml | strings -el | grep -E "^1\.[0-9]+\.[0-9]+$" || true
           unzip -p "$APK" AndroidManifest.xml | strings -el | grep -E "com\.xs\.fm" || true
 
       - name: 上传构建产物（artifact）
@@ -123,37 +145,43 @@ jobs:
             ${{ steps.ver.outputs.apk }}.sha256
           if-no-files-found: error
 
+      # 注意：不能用 secrets 做 step 级 if（GitHub 会报 Unrecognized named-value: 'secrets'），
+      #       所以这里用 if 判 ref、在脚本里判 secret 是否为空。
       - name: 发布到主仓库 Releases
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [ "${{ steps.ks.outputs.official }}" != "true" ]; then
-            echo "::notice::未配置签名密钥，跳过 Release 发布"; exit 0
+            echo "::notice::未配置签名密钥，跳过 Release 发布"
+            exit 0
           fi
           APK="${{ steps.ver.outputs.apk }}"
           TAG="${{ steps.ver.outputs.tag }}"
-          NOTES="RELEASE_NOTES_v${{ steps.ver.outputs.versionName }}.md"
-          # tag 触发时 tag 已存在（用 --verify-tag）；main 触发时由 gh 新建 tag（用 --target main）
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TARGET="--verify-tag"; else TARGET="--target main"; fi
+          VN="${{ steps.ver.outputs.versionName }}"
+          NOTES="RELEASE_NOTES_v${VN}.md"
+          if [ -f "$NOTES" ]; then NOTES_ARGS=(--notes-file "$NOTES"); else NOTES_ARGS=(--generate-notes); fi
           if gh release view "$TAG" > /dev/null 2>&1; then
             echo "Release $TAG 已存在 → 覆盖资产"
             gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
-          elif [ -f "$NOTES" ]; then
-            gh release create "$TAG" "$APK" "$APK.sha256" --title "${{ steps.ver.outputs.versionName }}" \
-              $TARGET --notes-file "$NOTES"
           else
-            gh release create "$TAG" "$APK" "$APK.sha256" --title "${{ steps.ver.outputs.versionName }}" \
-              $TARGET --generate-notes
+            # tag 触发时 tag 一定存在（--verify-tag）；main 触发时由 gh 建 tag（--target main）。
+            # tag 恰好已存在但还没有 Release 的情况，--target 可能报错，退回 --verify-tag 重试。
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              gh release create "$TAG" "$APK" "$APK.sha256" --title "$VN" --verify-tag "${NOTES_ARGS[@]}"
+            else
+              gh release create "$TAG" "$APK" "$APK.sha256" --title "$VN" --target main "${NOTES_ARGS[@]}" \
+                || gh release create "$TAG" "$APK" "$APK.sha256" --title "$VN" --verify-tag "${NOTES_ARGS[@]}"
+            fi
           fi
 
-      # 注意：不能用 secrets 做 step 级 if（GitHub 会报 Unrecognized named-value: 'secrets'），
-      #       所以这里用 if 判 ref、在脚本里判 secret 是否为空。
       - name: 同步模块发布仓库（Vector / LSPosed）
-        if: steps.ks.outputs.official == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        if: steps.ks.outputs.official == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then
             echo "::notice::未配置 RELEASE_REPO_TOKEN，跳过同步发布仓库"
             exit 0
@@ -163,26 +191,27 @@ jobs:
           TAG="${{ steps.ver.outputs.tag }}"
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${RELEASE_REPO}.git" rel
           # 发布仓库只保留当前版本 APK，历史版本由 Releases 承载
-          rm -f rel/fanqie-enhance-v*.apk rel/*.sha256
-          cp "$APK" rel/
-          cp "$APK.sha256" rel/
+          rm -f rel/fanqie-enhance-v*.apk rel/*.sha256 rel/Fanqie-Purify_v*.apk
+          cp "$APK" "$APK.sha256" rel/
           cp README.md rel/ 2>/dev/null || true
           cd rel
           git add -A
           git -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
             commit -m "release: v${VER}（自动同步）" || echo "无变更可提交"
           git push
+          cd ..
 
           # 发布仓库的 Release：资产名沿用历史约定 Fanqie-Purify_vX.Y.Z.apk
-          cd ..
           cp "$APK" "Fanqie-Purify_v${VER}.apk"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TARGET="--verify-tag"; else TARGET="--target main"; fi
+          ASSET="Fanqie-Purify_v${VER}.apk"
           if gh release view "$TAG" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
-            gh release upload "$TAG" "Fanqie-Purify_v${VER}.apk" --repo "$RELEASE_REPO" --clobber
+            gh release upload "$TAG" "$ASSET" --repo "$RELEASE_REPO" --clobber
           elif [ -f "RELEASE_NOTES_v${VER}.md" ]; then
-            gh release create "$TAG" "Fanqie-Purify_v${VER}.apk" --repo "$RELEASE_REPO" \
-              --title "$VER" $TARGET --notes-file "RELEASE_NOTES_v${VER}.md"
+            gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --target main \
+              --notes-file "RELEASE_NOTES_v${VER}.md" \
+              || gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --verify-tag \
+                   --notes-file "RELEASE_NOTES_v${VER}.md"
           else
-            gh release create "$TAG" "Fanqie-Purify_v${VER}.apk" --repo "$RELEASE_REPO" \
-              --title "$VER" $TARGET --generate-notes
+            gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --target main --generate-notes \
+              || gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --verify-tag --generate-notes
           fi
