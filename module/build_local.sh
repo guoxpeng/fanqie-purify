@@ -8,15 +8,22 @@
 # 资源与清单，再重新做 v1+v2 签名。
 #
 # 用法：  bash module/build_local.sh        # 产物 module-local.apk（默认以上一版 fanqie-enhance-*.apk 为模板）
+#        CI 上通过环境变量注入依赖路径即可（见 .github/workflows/build.yml），Windows/MSYS 与 Linux 都能跑。
 # 产物：  module-local.apk（可直接 adb install -r）
 #
 # 依赖路径按本机情况用环境变量覆盖（ANDROID_JAR / R8_JAR / APKSIG_JAR / BCPROV_JAR / BCPKIX_JAR / WORK）。
 set -e
 
 PROJ="$(cd "$(dirname "$0")/.." && pwd)"
+PY="${PYTHON:-$(command -v python3 || command -v python)}"   # Linux/CI 上通常只有 python3
 WORK="${WORK:-/d/fqbuild}"                                  # 中转目录，建议纯 ASCII 路径
 OUT_DIR="${OUT_DIR:-$PROJ}"
 WORK_WIN="$(cygpath -m "$WORK" 2>/dev/null || echo "$WORK")"   # 给原生 JDK 用的 Windows 风格路径
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) CPSEP=';' ;;    # Windows 版 JDK 用分号分隔 classpath
+  *)                    CPSEP=':' ;;    # Linux / macOS（CI）用冒号
+
+esac
 
 PATH_ANDROID_JAR="${ANDROID_JAR:-C:/Users/laogu/.gradle/caches/9.6.1/transforms/89cb022d2c3c3126a818eb517dab7192/transformed/android.jar}"
 PATH_R8="${R8_JAR:-$WORK_WIN/r8.jar}"                      # https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.5.35/r8-8.5.35.jar
@@ -45,7 +52,7 @@ javac -nowarn --release 8 -classpath "$AJ" -d "$W/stub_classes" \
 (cd stub_classes && jar cf "$W/stub.jar" .)
 
 echo "== [2/5] 编译模块主体 =="
-javac -nowarn --release 8 -classpath "$AJ;$W/stub.jar" -d "$W/classes" \
+javac -nowarn --release 8 -classpath "$AJ$CPSEP$W/stub.jar" -d "$W/classes" \
   "$W/src/com/eta/fanqie/enhance/MainHook.java"
 (cd classes && jar cf "$W/classes.jar" .)
 
@@ -57,7 +64,7 @@ ls -la out/classes.dex
 echo "== [4/5] 组装 APK（换 dex + 打补丁版本号，保留模板里的资源） =="
 # 注意：这一步在 $PROJ 目录下用「相对路径」调 python —— Windows 版 python 拿到含中文的
 #       绝对路径会因控制台编码(936)错乱，相对路径则没有这个问题。
-( cd "$PROJ" && python - "$(basename "$TEMPLATE_APK")" "module/AndroidManifest.xml" "$WORK_WIN" <<'PY'
+( cd "$PROJ" && "$PY" - "$(basename "$TEMPLATE_APK")" "module/AndroidManifest.xml" "$WORK_WIN" <<'PY'
 import re, struct, sys, zipfile
 tmpl, manifest_src, work = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(manifest_src, encoding="utf-8").read()
@@ -150,8 +157,8 @@ public class Sign {
     }
 }
 JAVA
-javac -nowarn -cp "$PATH_APKSIG;$BCPROV;$BCPKIX" -d "$W/signer" "$W/signer/Sign.java"
-java -cp "$W/signer;$PATH_APKSIG;$BCPROV;$BCPKIX" Sign "$KEYSTORE" android module \
+javac -nowarn -cp "$PATH_APKSIG$CPSEP$BCPROV$CPSEP$BCPKIX" -d "$W/signer" "$W/signer/Sign.java"
+java -cp "$W/signer$CPSEP$PATH_APKSIG$CPSEP$BCPROV$CPSEP$BCPKIX" Sign "$KEYSTORE" android module \
   "$W/unsigned.apk" "$W/module.apk"
 
 cp "$WORK/module.apk" "$OUT_DIR/module-local.apk"

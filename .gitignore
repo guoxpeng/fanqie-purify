@@ -34,3 +34,4 @@ tools/
 # ===== 工作记忆（本地） =====
 .workbuddy-ai/
 MODULE_MEMORY.md
+/module-local.apk

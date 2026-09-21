@@ -1,0 +1,13 @@
+# 仓库内统一用 LF：构建脚本会在 Linux（GitHub Actions）上被执行，
+# 带 CRLF 会让 `bash module/build_local.sh` 出现诡异的 \r 报错。
+* text=auto
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.py   text eol=lf
+*.java text eol=lf
+*.md   text eol=lf
+*.apk  binary
+*.png  binary
+*.jar  binary
+*.keystore binary
