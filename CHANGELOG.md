@@ -2,6 +2,36 @@
 
 所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.9.21] - 2026-10-04
+
+### 适配
+- **番茄畅听 `6.7.2.32`（versionCode `672`）实测通过**
+  - 资源 id **没有平移**（`aapt d resources` 逐项对比，模块用到的 13 个资源名 `old == new`），但**含义变了**：`6.7.1.32` 的 `br7`/`ej2`/`ce4` 在 `6.7.2.32` 的「我的」页里一个都不存在，`e4q` 也从「我的资产板块」变成了「快捷入口栏」
+  - 混淆类名变动：阅读页广告入口行工厂 `f22.q` → **`f32.q`**；VIP 促销弹层 `a13.d0` → **`i23.d0`**
+  - 其余 hook 目标（`AdConfigManager.checkAdAvailable`、`AdLynxHelper`、`MusicPatchAdContainer`、OneStop 两个策略类、`com.dragon.read.widget.dialog.i`、`AcctManager`/`AcctUserModel` 字段等）全部存在且签名未变
+
+### 修复
+- **「我的」页只剩空白、区块清不掉**（用户反馈）——三个层次的原因，逐个修掉：
+  1. **外层空壳没折叠**：只 `GONE` 最里面那层，外面 `cfe`/`cfd` 两层包装仍占着 `1008x238` 的布局高度，屏幕上就是一块空白。新增 `collapseEmptyAncestors()`：**从被隐藏的节点往上走，只要父容器已经没有可见且占位的内容就一起 GONE**，遇到页面外壳（头像行 / 标签栏）立刻停手
+  2. **`OnGlobalLayout` 监听只挂了一次**：以前用 `hasListenerAttached` 布尔量「只挂一次」，结果挂在开屏页 `SplashActivity` 的 decor 上，开屏页一 finish 就永远不会再被布局事件驱动；而底部四个 Tab 是同一个 Activity 里的兄弟容器，**切 Tab 不触发 `onResume`**，也没有重新 post 那次 150ms 的 `hideAll` —— 「我的」页就是这样整个漏掉的。改为按 decor 逐个挂（`WeakHashMap` 去重）+ 新增兜底看门狗（每次 `onResume` 后跑约 40 秒、每 2 秒扫一次，自动停）
+  3. **完全依赖资源 id 定位**：换一版就失效一次。见下「版本无关化」
+
+### 新增（版本无关化）
+- **「我的」页顶部区块（v1.9.21）**：不再认资源 id，改为「**头像行所在容器里，除头像行以外的子块全部收掉**」——拿住「个人主页」爬到整宽很扁的头像行，再取它的父容器（`6.7.2.32` 实测 `c1 > e63`），把其余子块（VIP 促销卡 / 快捷入口栏 / 我的资产 / 邀请好友 / 福利签到 / 直播商城…）整块 GONE。App 以后再往这里塞新广告位也会自动收掉，标签栏 `cxr`、头像行、底部导航用文案组合判定保留
+- **「我的」页闸门也改成文案**：`looksLikeMinePage()` 用「我的资产」判定（兜底「个人主页 + 金币余额」），不再用 `e4q`/`e4r` 这类资源 id
+- **设置页零散条目**：`hideExtraRows()` 按文案隐藏「设置 → 支付管理 / 免流量服务」整行（先找文案，再向上取「宽≥75% 屏宽、高≤12% 屏高」的整行容器），整行 GONE 后列表自然上移、不留空白
+- **桌面图标长按广告（用户反馈：今天最多可以赚3688金币 / 深度卸载 / 手机内存不足卡顿）**：这三个入口**不在 APK 里**（`resources.arsc` 与 15 个 dex 全 grep 不到），是服务端下发后由 `ShortcutManager` 动态发布的（id 为 `totalCoinId` / `uninstallId` / `storageId`）。**根因是类名写错了**：`ShortcutManager` 在 `android.content.pm` 包下，代码却写成 `android.app.ShortcutManager` —— 那个类根本不存在，于是每次启动都打「`ShortcutManager 不可用`」，发布环节一条都没拦住。修正后同时挂 `android.content.pm.ShortcutManager` 与 `androidx.core.content.pm.ShortcutManagerCompat` 的 `addDynamicShortcuts`/`setDynamicShortcuts`/`updateShortcuts`/`pushDynamicShortcut`，并在 `onResume` 用同一套规则清理已发布的
+- **更长/更短的广告文案**：`isLongAdText()` 的调用点以前被「长度 > 14」的门卡挡住，导致 4 个字的「深度卸载」永远走不到关键词规则。改为**先按关键词判定、只有长文案才需要 14 字护栏**；关键词补上 `深度清理 / 一键加速 / 立即加速 / 手机加速 / 手机降温 / 清理大师 / 手机耗电`（刻意不写 `手机内存 / 运行内存` 这种可能撞上书名的泛词）
+
+### 新增（工具）
+- **`tools/adapt_new_version.sh` —— 一键适配新版本**：拉包（自动从手机拷 `base.apk`）→ 资源 id 比对（模块用到的资源名在新旧版是否 `SAME`/`CHANGED`，资源名清单直接自动抽取自 `MainHook.java`）→ hook 目标存在性比对（含混淆类名，会自动把点分转成 dex 描述符）→ 结论 → 可选 `--build`（自动按 `major*100000+minor*10000+patch*100` bump 版本号、构建、安装）；`--arm-dump` / `--pull-tree` 负责新版页面的 View 树取证
+- **View 树转储改成运行时开关**：不再需要为了诊断重新编译。`adb shell su -c 'touch /data/data/com.xs.fm/cache/dump_mine'` 即开，转储写到 `tree_<Activity>.txt`（每 3 秒刷新、分 Activity 限频），发版时保持关闭（开销只是一次 `File.exists()`）。同时不再往 LSPosed 日志逐行打六七百行转储
+
+### 优化
+- 日志去噪：广告 View「构造即 GONE」、快捷方式过滤、顶栏跳过，都改成每类/每段文案只打一次（这几个以前会一次启动刷上千行，把 LSPosed 日志区淹掉）
+- `registerForceHideIds` 改为「合并」而不是「覆盖」`cachedHideIds`，避免把文案路径登记下来的 id 冲掉
+- 修掉 `build_local.sh` 的 `versionCode` 补丁：原来靠「扫 180000~210000 的唯一整数、取离 versionName 最近者」猜，会猜错到 194560 而 `versionCode` 纹丝不动；改为解析二进制 `AndroidManifest.xml` 按属性名精确定位（含本仓库 UTF-16 字符串池的 **u16 长度前缀**兼容）
+
 ## [CI] 自动打包 / 自动发布 - 2026-09-21
 
 ### 新增
