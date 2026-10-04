@@ -30,7 +30,17 @@ PATH_R8="${R8_JAR:-$WORK_WIN/r8.jar}"                      # https://dl.google.c
 PATH_APKSIG="${APKSIG_JAR:-C:/Users/laogu/.gradle/caches/modules-2/files-2.1/com.android.tools.build/apksig/9.3.1/2881101f6a9d0baf6a341926ef0ff08c98a5d13b/apksig-9.3.1.jar}"
 BCPROV="${BCPROV_JAR:-C:/Users/laogu/.gradle/caches/modules-2/files-2.1/org.bouncycastle/bcprov-jdk18on/1.79/4d8e2732bcee15f1db93df266c3f5b70ce5cac21/bcprov-jdk18on-1.79.jar}"
 BCPKIX="${BCPKIX_JAR:-C:/Users/laogu/.gradle/caches/modules-2/files-2.1/org.bouncycastle/bcpkix-jdk18on/1.79/7693cec3b8779b74b35466dcaeeaac7409872954/bcpkix-jdk18on-1.79.jar}"
-TEMPLATE_APK="${TEMPLATE_APK:-$PROJ/fanqie-enhance-v1.9.20.apk}"   # 上一版（同一 keystore 签的）模块包
+# 上一版（同一 keystore 签的）模块包：默认自动取仓库里最新的一个 fanqie-enhance-v*.apk，
+# 免得发新版后忘了改这里、一直拿好几个版本前的旧包当模板（本模块自己没有资源，
+# 模板只提供图标/xml 等资产 + 清单骨架，所以旧包能用但容易让人误会）。
+# ⚠️ 不能用 `ls -1t` 取「最新」：CI 是全新检出，所有文件 mtime 几乎相同，
+#    `ls -1t` 会退化成目录顺序、挑到最旧的包（实测挑中 v1.9.10），
+#    连它的 assets/xposed_init 的 CRLF 也一起继承了。改为按版本号排序取最大。
+if [ -z "${TEMPLATE_APK:-}" ]; then
+  TEMPLATE_APK="$(ls -1 "$PROJ"/fanqie-enhance-v*.apk 2>/dev/null | sort -V | tail -1)"
+  [ -n "$TEMPLATE_APK" ] || TEMPLATE_APK="$PROJ/fanqie-enhance-v1.9.20.apk"
+fi
+TEMPLATE_APK="${TEMPLATE_APK}"
 KEYSTORE="${KEYSTORE:-$WORK_WIN/module.keystore}"                      # 手机上那份：/data/local/tmp/fuck_andes/module/module.keystore
 
 mkdir -p "$WORK"
@@ -97,12 +107,69 @@ if len(cand) != 1:
 off, old_text = cand[0]
 mf = mf[:off] + vname.encode("utf-16-le") + mf[off + len(old_text) * 2:]
 
-# versionCode 是小端 int 属性值：按模板里扫到的旧值替换（拿 hits 数量对它做校验）。
-cand_codes = [c for c in range(180000, 210000) if mf.count(struct.pack("<I", c)) == 1]
-if not cand_codes:
-    raise SystemExit("没找到唯一的旧 versionCode 候选值")
-old_code = min(cand_codes, key=lambda c: abs(mf.index(struct.pack("<I", c)) - off))
-mf = mf.replace(struct.pack("<I", old_code), struct.pack("<I", vcode))
+# versionCode 是 <manifest> 元素上名为 "versionCode" 的 INT_DEC 属性。
+# ⚠️ 不要靠「扫描 180000~210000 里出现的唯一整数、取离 versionName 最近的那个」来猜：
+#    二进制 XML 里还有不少别的整数（如 194560 / 208384），它们的字节位置往往比真正的
+#    versionCode 更靠近字符串池，猜错就会把无意义的整数改成新版本号，而 versionCode 纹丝不动。
+#    这里直接解析二进制 XML，按属性名精确定位。
+def axml_attrs(buf):
+    """解析二进制 XML，返回 (字符串池, [(属性名, data 字段偏移, data 值), ...])。"""
+    def uleb(p):
+        r = s = 0
+        while True:
+            b = buf[p]; p += 1
+            r |= (b & 0x7F) << s
+            if not (b & 0x80):
+                return r, p
+            s += 7
+    assert struct.unpack_from("<I", buf, 0)[0] == 0x00080003, "不是二进制 AndroidManifest.xml"
+    strings, attrs, off = [], [], 8
+    while off + 8 <= len(buf):
+        ctype, _hsize, csize = struct.unpack_from("<HHI", buf, off)
+        if csize == 0:
+            break
+        if ctype == 0x0001:                       # string pool
+            cnt, _scnt, flags, str_start = struct.unpack_from("<IIII", buf, off + 8)
+            # 偏移数组位于 chunk 头(8) + ResStringPool_header(20) 之后
+            offs = [struct.unpack_from("<I", buf, off + 28 + 4 * i)[0] for i in range(cnt)]
+            strings = []
+            for o in offs:
+                p = off + str_start + o
+                if flags & (1 << 8):              # UTF-8 池
+                    _, p = uleb(p)
+                    n, p = uleb(p)
+                    strings.append(buf[p:p + n].decode("utf-8", "replace"))
+                else:                             # UTF-16 池
+                    # 注意：本仓库模板里的池用 **u16 长度前缀**，不是标准的 uleb128 ——
+                    # 按 uleb128 读会把数据整体错开一字节，得到一堆乱码（“versionCode”
+                    # 会变成“瘀攀爀猀椀漀渀…”，于是按名字找属性永远找不到）。
+                    # 先按 u16 试，校验结尾是不是 0x0000 终结符；不是再退回 uleb128。
+                    n16 = struct.unpack_from("<H", buf, p)[0]
+                    q = p + 2 + n16 * 2
+                    if q + 2 <= len(buf) and buf[q] == 0 and buf[q + 1] == 0:
+                        strings.append(buf[p + 2:q].decode("utf-16-le", "replace"))
+                    else:
+                        n, q = uleb(p)
+                        strings.append(buf[q:q + n * 2].decode("utf-16-le", "replace"))
+        elif ctype == 0x0102:                     # start element
+            _ns, _nm, a_start, a_size, a_cnt = struct.unpack_from("<IIHHH", buf, off + 16)
+            base = off + 16 + a_start
+            for i in range(a_cnt):
+                a = base + i * a_size
+                _ans, a_name, _raw, _sz, _r0, dtype, data = struct.unpack_from("<IIIHBBI", buf, a)
+                attrs.append((a_name, a + 16, dtype, data))
+        off += csize
+    return strings, attrs
+
+strings, attrs = axml_attrs(mf)
+vc_off = None
+for name_idx, doff, dtype, data in attrs:
+    if dtype == 0x10 and strings[name_idx] == "versionCode":
+        vc_off = doff
+        break
+if vc_off is None:
+    raise SystemExit("二进制清单里没找到 versionCode 属性")
+mf = mf[:vc_off] + struct.pack("<I", vcode) + mf[vc_off + 4:]
 
 out = work + "/unsigned.apk"
 dex = open(work + "/out/classes.dex", "rb").read()
@@ -115,6 +182,11 @@ for info in zin.infolist():
         data = dex
     elif info.filename == "AndroidManifest.xml":
         data = mf
+    elif info.filename == "assets/xposed_init":
+        # 这一项是从模板原样带过来的，模板若是 CRLF（v1.9.10 就是），
+        # 新包也会是 CRLF —— 虽然框架 readLine()+trim() 能容忍，但没必要，
+        # 统一成 LF，跟本地构建/历史发布保持一致。
+        data = data.replace(b"\r\n", b"\n")
     zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
     zi.compress_type = info.compress_type
     zi.external_attr = info.external_attr
