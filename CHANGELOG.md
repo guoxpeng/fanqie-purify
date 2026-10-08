@@ -2,6 +2,38 @@
 
 所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.9.23] - 2026-10-05
+
+### 新增（用户反馈：听一段时间会冒出「XX金币已到账…」语音广告）
+- **屏蔽「金币语音播报」**：`hookVoiceCastBlocker()` —— 逆向 `classes13.dex` 定位到字节 Polaris（增长/激励体系）的语音播报子系统，在**播放入口源码级短路**：
+  - `com.bytedance.polaris.impl.voice.w.a(String,String)`（场景 `POLARIS_COIN_AUDIO_TIPS`，日志文案「开始播放语音播报」）
+  - `com.bytedance.polaris.impl.voice.w.o(SentenceTemplate,Map,long,String)`（模板语音）
+  - `com.bytedance.polaris.impl.audio.AudioHelper.s(String)/r(long)/j(String)`（真正下声的底层音频入口）
+  - 只短路**返回 void** 的重载（辅助方法 `hookVoidMethods` 会先查返回类型，`boolean/String` 这类策略查询一律不碰，不会破坏调用方状态机）
+  - 关键取证字符串：`开始播放语音播报` / `金币语音播报完成` / `已关闭金币播报` / `阅读%d分钟，奖励%s金币已到账，可到福利页面查看!` / `warningtone_template_1_default_1.aac`（⌨ 是**下载的 .aac**，不是 TTS）
+  - 实测日志：`✅ 金币语音播报屏蔽已挂载` + `🔇 已拦截语音播报: com.bytedance.polaris.impl.audio.AudioHelper.j`
+- **顺带补齐广告模块自己的弹窗**：Dialog 类名拦截加上 `admodule` / `unlocktime`（逆向得到 `com.dragon.read.admodule.adfm.unlocktime.ui.*` 共 8 个原生弹窗，都是广告解锁弹层）
+- **修掉一个从 v1.9.7 起就静默失效的 hook（silk subwindow 拦截器）**：
+  `com.bytedance.component.silk.road.subwindow.manager.c` 是**接口/抽象类**，它的 `e(y70.c)` 没有方法体，
+  直接 `hookAllMethods` 会抛 `IllegalArgumentException: ... is abstract: it has no body to hook` ——
+  于是这个「页面弹窗广告中央调度」拦截器**一直没挂上**（日志里每进程一行「失败」，很容易被别的噪声淹没）。
+  逆向 `classes11.dex` 找到两个具体实现（`...subwindow.manager.f`、`z70.a`），改为 hook 具体实现；
+  现在日志会打：`silk subwindow manager 拦截器已启用（成功挂载 2 个类）`
+
+### 逆向工具（主动出击）
+- **`tools/adscan.py`**：按关键词枚举 dex 里的真实定义类（广告 / 弹窗 / 会员促销 / hybrid bridge 四组），支持字符串池搜索。本次就是靠它一次拿到 5181 个广告相关类、28 个 hybrid bridge 模块、`com.dragon.read.widget.dialog.i` 的 85 个子类（全部原生弹窗族）
+- **`tools/dexsig.py`**：打印类的方法签名清单（决定 hook 哪种重载签名用）
+
+## [v1.9.22] - 2026-10-05
+
+### 修复（用户反馈：屏幕上还有跳出来的广告）
+- **听书页整块会员促销浮层漏网**（实测 uiautomator 拿到 `desc=[仅限当前设备开通7天会员，限时有效]`，位于 `AudioPlaySingleActivity` 上方的浮动窗口）。根因两条：
+  1. 它是服务端下发的 **Lynx/自绘 Dialog，整层没有任何 `TextView`**，文案只挂在 **View 的 `content-desc`** 上；而旧的 `findBadText()` 只读 `TextView.getText()`，还在 `length <= 16` 上直接卡掉（该文案 17 个字）
+  2. 该文案**不在 APK 里**（aapt 只能找到同义的 `string/ab0`、`string/cnx`），无法按类名 / 资源 id 定位
+- 修复：`findPromoPopupText()` —— 扫整棵弹窗子树**所有 View 的 `content-desc` + `text`**；`PROMO_POPUP_PATTERNS`（仅限当前设备 / 限时有效 / 限时优惠 / 限时特惠 / 不自动续费 / 随机优惠 / 开通7天 / 7天会员 / 会员权益 / 首月 …，再加「开通/续费 + 会员」组合）；**护栏故意不做尺寸判定** —— 实测该弹层窗口 decor 是**整屏 1080x2400 的透明壳**（真内容只有中间 886x1410），按尺寸会把弹层当成整页而跳过；改靠**文案特异性**（用户主动打开的会员开通页是 Activity 不是 Dialog，本来就走不到这里）；`Dialog.show` 后 **0/300/800/1600/2800ms 多点扫描**（Lynx 异步渲染，单次扫描必漏）
+- 新增**悬浮窗兜底网**：`hookFloatingPromoWindows()` hook `WindowManagerGlobal.addView`，只处理浮动类型窗口（`type=2` / panel / attachedDialog / overlay，**绝不碰 activity 自身窗口 type=1**），命中促销文案就 `removeViewImmediate` 整窗摘掉（**只设 GONE 不行**：透明模态窗口还在，会继续吃触摸，表现为界面「卡死」）
+- 新增 **Dialog.show 类名观测日志**（去重）：`Dialog.show 观测到类: xxx` —— 以后再遇到漏网弹窗，日志里直接就有类名，不用再猜
+
 ## [v1.9.21] - 2026-10-04
 
 ### 适配

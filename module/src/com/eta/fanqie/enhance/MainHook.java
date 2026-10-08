@@ -23,7 +23,28 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * 番茄畅听增强模块 v1.9.21（适配 6.7.2.32 / versionCode 672）
+ * 番茄畅听增强模块 v1.9.23（适配 6.7.2.32 / versionCode 672）
+ * v1.9.23 新增：屏蔽「XX金币已到账…」语音播报广告 —— 逆向 classes13.dex 定位到字节
+ *   Polaris（增长/激励体系）语音播报子系统，在播放入口源码级短路：
+ *   hookVoiceCastBlocker() → com.bytedance.polaris.impl.voice.w.a|o
+ *   + com.bytedance.polaris.impl.audio.AudioHelper.s|r|j（辅助方法 hookVoidMethods
+ *   只短路**返回 void** 的重载，boolean/String 这类策略查询一律不碰）。
+ *   并修掉一个从 v1.9.7 起就**静默失效**的 hook：silk subwindow 拦截器原来 hook 的是
+ *   接口/抽象类 com.bytedance.component.silk.road.subwindow.manager.c 的 e(y70.c)，
+ *   没有方法体 → hookAllMethods 抛 "is abstract: it has no body to hook"，
+ *   于是这个「页面弹窗广告中央调度」拦截器一直没挂上；改为 hook 具体实现类
+ *   ...subwindow.manager.f 与 z70.a。
+ * v1.9.22 修复「听书页会员促销弹层漏网」（屏幕上「仅限当前设备开通7天会员，限时有效」整块浮层）：
+ *   - 真因：那是服务端下发的 Lynx/自绘促销 Dialog，**整层没有任何 TextView**，
+ *     文案只挂在 View 的 content-desc 上（uiautomator 里 desc=[仅限当前设备开通7天会员，限时有效]），
+ *     而旧 findBadText 只读 TextView.getText()、且 length<=16 —— 两个条件都不成立。
+ *     该文案也不在 APK 里（aapt 只能找到同义的 string/ab0、string/cnx），无法按类名/资源 id 定位。
+ *   - 修复：新增 findPromoPopupText()（扫整棵弹窗子树的所有 View 的 content-desc + text）
+ *     + PROMO_POPUP_PATTERNS（仅限当前设备/限时有效/不自动续费/开通+会员…）
+ *     （护栏**故意不用尺寸**：实测该弹层窗口 decor 是整屏 1080x2400 的透明壳，
+ *       真内容只有中间 886x1410，按尺寸判会把弹层当成整页而跳过；改靠文案特异性）
+ *     + Dialog.show 后 0/300/800/1600/2800ms 多点扫描（Lynx 异步渲染才会出文案）。
+ *   - 另新增 Dialog.show 类名观测日志（去重），换版本后可据此定位新的漏网弹窗类。
  * 基底 = v1.9.5：VIP patch、底部商城/领现金tab隐藏、广告卡整体隐藏、
  *   三级入口隐藏(hideEntry/hideShallow/hideChain)、桌面快捷方式清理、阅读页金币面板、弹窗拦截。
  * 合入 adfix 增强：hookAdSignals 源码级拦截广告SDK调用、更广 BLOCKED 页面前缀。
@@ -270,19 +291,27 @@ public class MainHook implements IXposedHookLoadPackage {
     private boolean readerAdLineHooked = false;
     /** v1.9.19 首页 VIP 促销全屏弹层拦截是否已挂载 */
     private boolean vipPromoHooked = false;
+    /** v1.9.22 悬浮窗（WindowManagerGlobal.addView）促销文案兜底是否已挂载 */
+    private boolean floatingPromoHooked = false;
+    /** v1.9.23 语音播报（金币已到账…）屏蔽是否已挂载 */
+    private boolean voiceCastHooked = false;
+    /** v1.9.23 已打过日志的语音播报入口（只打一次） */
+    private final Set<String> loggedVoiceEntries = new HashSet<>();
     /** v1.9.18 已屏蔽过的广告入口行（只打一次日志） */
     private final Set<String> readerAdLineBlocked = new HashSet<>();
     /** v1.9.21 已打过「构造即 GONE」日志的广告 View 类（这些 View 会高频重复构造，只打一次） */
     private final Set<String> loggedCtorClasses = new HashSet<>();
     /** v1.9.21 已打过「位于顶栏内、跳过隐藏」日志的文案（每 2 秒重复一次，只打一次） */
     private final Set<String> loggedTopBarSkipped = new HashSet<>();
+    /** v1.9.22 已打过「Dialog.show 观测到类」日志的弹窗类（诊断漏网弹窗用，每个类只打一次） */
+    private final Set<String> loggedDialogClasses = new HashSet<>();
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         if (!"com.xs.fm".equals(lpparam.packageName)) {
             return;
         }
-        XposedBridge.log("[" + TAG + "] v1.9.21 加载: process=" + lpparam.processName);
+        XposedBridge.log("[" + TAG + "] v1.9.23 加载: process=" + lpparam.processName);
         this.appCl = lpparam.classLoader;
         hookActivityBlocker();
         hookDialogBlocker();
@@ -301,6 +330,8 @@ public class MainHook implements IXposedHookLoadPackage {
         hookOneStopReaderAd();           // v1.9.14 新增：从源头关闭阅读页 OneStop 一站式广告（去空白）
         hookReaderAdLineFactory();       // v1.9.18 新增：从源头屏蔽章节末广告入口行（看小视频免30分钟广告等）
         hookVipPromotionPopup();         // v1.9.19 新增：从源头屏蔽首页 VIP 促销全屏弹层
+        hookFloatingPromoWindows();      // v1.9.22 新增：非 Dialog 的促销悬浮窗兜底（会员促销弹层）
+        hookVoiceCastBlocker();          // v1.9.23 新增：屏蔽「金币已到账…」语音播报广告
         scheduleAdSignalRetry();
         scheduleMineTreeDump();          // v1.9.21 诊断：抓「我的」页视图树
     }
@@ -3181,7 +3212,13 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedBridge.log("[" + TAG + "] silk subwindow manager 接口未找到，跳过");
                 return;
             }
-            XposedBridge.hookAllMethods(mgrCls, "e", new XC_MethodHook() {
+            // ⚠️ v1.9.23 修：`manager.c` 是**接口/抽象类**，它的 `e(y70.c)` 没有方法体，
+            // 直接 hook 会抛 IllegalArgumentException("... is abstract: it has no body to hook")，
+            // 于是这个拦截器**从 v1.9.7 起就一直静默失效**（只在日志里留一行「失败」）。
+            // 逆向 classes11.dex 拿到两个具体实现类，改为 hook 具体实现：
+            //   Lcom/bytedance/component/silk/road/subwindow/manager/f;
+            //   Lz70/a;
+            final XC_MethodHook silkHook = new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
                         Object arg = (param.args != null && param.args.length > 0) ? param.args[0] : null;
@@ -3191,8 +3228,22 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                     } catch (Throwable ignored) {}
                 }
-            });
-            XposedBridge.log("[" + TAG + "] silk subwindow manager 拦截器已启用");
+            };
+            String[] silkTargets = {
+                    "com.bytedance.component.silk.road.subwindow.manager.c",  // 接口（旧版本可能是有方法体的抽象类）
+                    "com.bytedance.component.silk.road.subwindow.manager.f",  // 具体实现
+                    "z70.a",                                                  // 具体实现
+            };
+            int silkHooked = 0;
+            for (String sn : silkTargets) {
+                try {
+                    Class<?> sc = XposedHelpers.findClassIfExists(sn, appCl);
+                    if (sc == null) continue;
+                    XposedBridge.hookAllMethods(sc, "e", silkHook);
+                    silkHooked++;
+                } catch (Throwable ignored) {}
+            }
+            XposedBridge.log("[" + TAG + "] silk subwindow manager 拦截器已启用（成功挂载 " + silkHooked + " 个类）");
         } catch (Throwable t) {
             XposedBridge.log("[" + TAG + "] silk subwindow manager 拦截器失败: " + t);
         }
@@ -3315,6 +3366,11 @@ public class MainHook implements IXposedHookLoadPackage {
                         final Dialog dlg = (Dialog) param.thisObject;
                         if (dlg == null) return;
                         String name = dlg.getClass().getName();
+                        // v1.9.22 诊断：把每个真正 show 出来的 Dialog 类名记一次（去重），
+                        // 方便换版本后核对「漏网弹窗」到底是哪个类。
+                        if (loggedDialogClasses.add(name)) {
+                            XposedBridge.log("[" + TAG + "] Dialog.show 观测到类: " + name);
+                        }
                         boolean classHit = name.contains("luckycat") || name.contains("Lucky")
                                 || name.contains("Update") || name.contains("Upgrade")
                                 || name.contains("AdDialog") || name.contains("AdPop")
@@ -3323,24 +3379,36 @@ public class MainHook implements IXposedHookLoadPackage {
                                 || name.contains("Reward") || name.contains("Task")
                                 || name.contains("Welfare") || name.contains("RedPacket")
                                 || name.contains("Sign") || name.contains("Invite")
-                                || name.contains("Mall") || name.contains("Shop");
+                                || name.contains("Mall") || name.contains("Shop")
+                                || name.contains("Promo") || name.contains("Promotion")
+                                || name.contains("VipPromo") || name.contains("VipPopup")
+                                // v1.9.23：广告模块自己的弹窗（逆向：com.dragon.read.admodule.adfm.unlocktime.ui.* 共 8 个）
+                                || name.contains("admodule") || name.contains("unlocktime");
                         if (classHit) {
                             dlg.dismiss();
                             XposedBridge.log("[" + TAG + "] 已拦截弹窗(类名): " + name);
                             return;
                         }
-                        h.postDelayed(new Runnable() {
-                            @Override public void run() {
-                                try {
-                                    if (!dlg.isShowing()) return;
-                                    String hit = findBadDialogText(dlg);
-                                    if (hit != null) {
-                                        dlg.dismiss();
-                                        XposedBridge.log("[" + TAG + "] 已拦截弹窗(内容:'" + hit + "'): " + name);
-                                    }
-                                } catch (Throwable ignored) {}
-                            }
-                        }, 400);
+                        // v1.9.22：Lynx/自绘促销弹层是异步渲染的，且文案只落在 content-desc 上
+                        // （没有任何 TextView），单次 400ms + 只读 text 的扫描必然漏掉
+                        // 「仅限当前设备开通7天会员，限时有效」这类弹层 →
+                        // 改为多点扫描(0/300/800/1600/2800ms) + 同时扫 text 与 content-desc。
+                        final int[] delays = {0, 300, 800, 1600, 2800};
+                        for (final int delay : delays) {
+                            h.postDelayed(new Runnable() {
+                                @Override public void run() {
+                                    try {
+                                        if (!dlg.isShowing()) return;
+                                        String hit = findBadDialogText(dlg);
+                                        if (hit == null) hit = findPromoPopupText(dlg);
+                                        if (hit != null) {
+                                            dlg.dismiss();
+                                            XposedBridge.log("[" + TAG + "] 已拦截弹窗(内容:'" + hit + "'): " + name);
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+                            }, delay);
+                        }
                     } catch (Throwable ignored) {}
                 }
             });
@@ -3358,6 +3426,215 @@ public class MainHook implements IXposedHookLoadPackage {
             return null;
         }
     }
+
+    // ================= v1.9.22：会员/促销弹层通用拦截 =================
+
+    /**
+     * 会员/促销弹层文案特征。怀疑命中即整层 dismiss —— 这些文案只会出现在
+     * 服务端下发的促销浮层里（如「仅限当前设备开通7天会员，限时有效」），
+     * 不会出现在正常页面内容上。
+     */
+    private static final String[] PROMO_POPUP_PATTERNS = {
+            "仅限当前设备", "限时有效", "限时优惠", "限时特惠", "限时秒杀",
+            "不自动续费", "随机优惠", "开通7天", "7天会员", "会员特惠",
+            "续费立减", "开通享", "会员权益", "首月", "限时福利", "专享价",
+    };
+
+    /** 单条文案是否像会员/促销弹层文案（仅用于弹窗内容，不用于页面内入口） */
+    private boolean isPromoPopupText(String s) {
+        if (s == null) return false;
+        String t = s.trim();
+        if (t.isEmpty() || t.length() > 90) return false;
+        for (String k : PROMO_POPUP_PATTERNS) {
+            if (t.contains(k)) return true;
+        }
+        // 「开通/续费」+「会员」组合（文案可能是「开通会员」「立即续费会员」等）
+        if ((t.contains("开通") || t.contains("续费")) && t.contains("会员")) return true;
+        return false;
+    }
+
+    /**
+     * 扫弹窗子树，找会员/促销文案。
+     * 关键：Lynx/自绘弹层没有任何 TextView，文案只落在 View 的 content-desc 上
+     * （uiautomator 里看到的 desc=[仅限当前设备开通7天会员，限时有效] 就是它），
+     * 所以这里对**所有 View** 都读 content-desc，而不只是 TextView.getText()。
+     */
+    private String findPromoPopupText(Dialog dlg) {
+        try {
+            View decor = dlg.getWindow().getDecorView();
+            return findPromoTextIn(decor, 0);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private String findPromoTextIn(View v, int depth) {
+        if (v == null || depth > 14) return null;
+        try {
+            CharSequence cd = v.getContentDescription();
+            if (cd != null) {
+                String s = cd.toString().trim();
+                if (isPromoPopupText(s)) return s;
+            }
+        } catch (Throwable ignored) {}
+        if (v instanceof TextView) {
+            try {
+                CharSequence cs = ((TextView) v).getText();
+                if (cs != null) {
+                    String s = cs.toString().trim();
+                    if (isPromoPopupText(s)) return s;
+                }
+            } catch (Throwable ignored) {}
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                String r = findPromoTextIn(vg.getChildAt(i), depth + 1);
+                if (r != null) return r;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * v1.9.23 新增：屏蔽「金币语音播报」——听书一段时间后突然冒出来的
+     * 「XX金币已到账…」语音广告（Polaris 增长体系下发，不是 TTS 而是下载的 .aac）。
+     *
+     * <p>逆向 classes13.dex 定位（文案只在这套 dex 里）：
+     * <pre>
+     *   '开始播放语音播报' / '金币语音播报完成' / '已关闭金币播报'
+     *   '阅读%d分钟，奖励%s金币已到账，可到福利页面查看!'
+     *   'warningtone_template_1_default_1.aac'
+     *   com.bytedance.polaris.impl.voice.w.a(String,String)      场景 POLARIS_COIN_AUDIO_TIPS
+     *   com.bytedance.polaris.impl.voice.w.o(SentenceTemplate,Map,long,String)
+     *   com.bytedance.polaris.impl.audio.AudioHelper.s(String)/r(long)/j(String)  底层音频
+     * </pre>
+     * 策略：上述入口全部短路（均为 void 方法，setResult(null) 不会破坏调用方状态机）。
+     * 只动语音播放（tone/audio tips）链路，不动听书播放器本身。
+     */
+    private void hookVoiceCastBlocker() {
+        if (voiceCastHooked) return;
+        boolean any = false;
+        any |= hookVoidMethods("com.bytedance.polaris.impl.voice.w", "a", "o");
+        any |= hookVoidMethods("com.bytedance.polaris.impl.audio.AudioHelper", "s", "r", "j");
+        if (any) {
+            voiceCastHooked = true;
+            XposedBridge.log("[" + TAG + "] ✅ 金币语音播报屏蔽已挂载 (Polaris voice/audio)");
+        } else {
+            XposedBridge.log("[" + TAG + "] 金币语音播报屏蔽：目标类未找到（版本可能已变）");
+        }
+    }
+
+    /** 把指定类中给定名字的无返回值方法全部短路（返回 void 才能安全 setResult(null)） */
+    private boolean hookVoidMethods(final String clsName, final String... methodNames) {
+        try {
+            Class<?> cls = XposedHelpers.findClassIfExists(clsName, appCl);
+            if (cls == null) {
+                XposedBridge.log("[" + TAG + "] 语音播报目标类不存在: " + clsName);
+                return false;
+            }
+            boolean hit = false;
+            for (final String mn : methodNames) {
+                try {
+                    XposedBridge.hookAllMethods(cls, mn, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.method instanceof java.lang.reflect.Method
+                                        && ((java.lang.reflect.Method) param.method).getReturnType() != void.class) {
+                                    return;   // 非 void（如 o()Z 策略查询）不动，避免破坏状态机
+                                }
+                                param.setResult(null);
+                                String key = clsName + "." + mn;
+                                if (loggedVoiceEntries.add(key)) {
+                                    XposedBridge.log("[" + TAG + "] 🔇 已拦截语音播报: " + key);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+                    hit = true;
+                } catch (Throwable ignored) {}
+            }
+            return hit;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * v1.9.22 兜底网：不是所有促销浮层都是 Dialog —— 有些是直接往
+     * WindowManagerGlobal 里 addView 的独立窗口（Lynx popup）。
+     * 这里在窗口加入时扫描一次，命中促销文案就整窗移除。
+     * 只处理浮动类型窗口（type=2/panel/attachedDialog/overlay），
+     * **绝不碰 activity 自身窗口（type=1）**。
+     */
+    private void hookFloatingPromoWindows() {
+        if (floatingPromoHooked) return;
+        try {
+            Class<?> wmg = XposedHelpers.findClassIfExists("android.view.WindowManagerGlobal", appCl);
+            if (wmg == null) {
+                XposedBridge.log("[" + TAG + "] 悬浮窗兜底：WindowManagerGlobal 未找到");
+                return;
+            }
+            XposedBridge.hookAllMethods(wmg, "addView", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 2) return;
+                        if (!(param.args[0] instanceof View)) return;
+                        final View root = (View) param.args[0];
+                        if (!(param.args[1] instanceof android.view.WindowManager.LayoutParams)) return;
+                        int ty = ((android.view.WindowManager.LayoutParams) param.args[1]).type;
+                        boolean floating = (ty == android.view.WindowManager.LayoutParams.TYPE_APPLICATION)
+                                || (ty == android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL)
+                                || (ty == android.view.WindowManager.LayoutParams.TYPE_APPLICATION_ATTACHED_DIALOG)
+                                || (ty == android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+                        if (!floating) return;
+                        final Object wmgObj = param.thisObject;
+                        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                            @Override public void run() {
+                                try {
+                                    String hit = findPromoTextIn(root, 0);
+                                    if (hit == null) return;
+                                    // 必须真正把窗口摘掉：只设 GONE 的话透明模态窗口还在，
+                                    // 会继续吃掉触摸事件（表现为界面「卡死」）。
+                                    boolean removed = false;
+                                    try {
+                                        java.lang.reflect.Method rm = wmgObj.getClass()
+                                                .getMethod("removeViewImmediate", View.class);
+                                        rm.setAccessible(true);
+                                        rm.invoke(wmgObj, root);
+                                        removed = true;
+                                    } catch (Throwable t1) {
+                                        try {
+                                            java.lang.reflect.Method rm2 = wmgObj.getClass()
+                                                    .getMethod("removeView", View.class);
+                                            rm2.setAccessible(true);
+                                            rm2.invoke(wmgObj, root);
+                                            removed = true;
+                                        } catch (Throwable ignored) {}
+                                    }
+                                    XposedBridge.log("[" + TAG + "] 已" + (removed ? "移除" : "识别到(移除失败)")
+                                            + "促销悬浮窗(内容:'" + hit + "')");
+                                } catch (Throwable ignored) {}
+                            }
+                        }, 700);
+                    } catch (Throwable ignored) {}
+                }
+            });
+            floatingPromoHooked = true;
+            XposedBridge.log("[" + TAG + "] ✅ 悬浮窗促销文案兜底已启用 (WindowManagerGlobal.addView)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] 悬浮窗兜底启用失败: " + t);
+        }
+    }
+
+    /**
+     * 注：这里**故意不做尺寸护栏**。
+     * 实测那个促销弹层的窗口 decor 是**整屏 1080x2400 的透明壳**（真正的内容只有中间
+     * 886x1410），任何「decor 小于屏幕才算弹窗」的判定都会把它当成整页而跳过。
+     * 因此护栏改为**文案特异性**：PROMO_POPUP_PATTERNS 里的（仅限当前设备 / 限时有效 /
+     * 不自动续费 / 开通7天…）都只会出现在服务端下发的促销浮层上；
+     * 用户主动打开的会员开通页是 Activity 而不是 Dialog，本来就不会走到这里。
+     */
 
     private String findBadText(View v, int depth) {
         if (v == null || depth > 12) return null;

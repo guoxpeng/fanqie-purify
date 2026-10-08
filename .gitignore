@@ -39,6 +39,8 @@ module/deploy.py
 # 「一键适配新版本」脚本（会自动定位 adb/aapt），所以单独豁免入库。
 tools/*
 !tools/adapt_new_version.sh
+!tools/adscan.py
+!tools/dexsig.py
 
 # ===== 工作记忆（本地） =====
 .workbuddy-ai/

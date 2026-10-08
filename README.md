@@ -5,7 +5,7 @@
 > 🏠 **项目主页 / 最新版本 / 问题反馈**：[**`guoxpeng/fanqie-purify`**](https://github.com/guoxpeng/fanqie-purify)
 > 📦 **发布镜像**（Vector / LSPosed 管理器读取）：[`Xposed-Modules-Repo/com.eta.fanqie.enhance`](https://github.com/Xposed-Modules-Repo/com.eta.fanqie.enhance)
 
-> **当前版本：v1.9.21** ｜ **适配目标应用：番茄畅听 `6.7.2.32`（versionCode `672`）实测通过**
+> **当前版本：v1.9.23** ｜ **适配目标应用：番茄畅听 `6.7.2.32`（versionCode `672`）实测通过**
 > 框架要求：Root + Vector 或 LSPosed（xposedminversion 82，Android 8.0+）
 
 > 💡 **v1.9.21 起「我的」页 / 设置项 / 桌面长按广告都改成了「文案 + 结构」的版本无关做法** ——
@@ -27,7 +27,7 @@
 
 | 番茄畅听版本 | versionCode | 对应模块版本 | 状态 | 该版新增的适配要点 |
 |---|---|---|---|---|
-| **`6.7.2.32`** | **`672`** | **v1.9.21** | ✅ **当前版本，实测通过** | 资源 id **没有平移**（13 个名字全部 `old == new`）但**含义变了**（`e4q` 从「我的资产」变成「快捷入口栏」，`br7`/`ej2`/`ce4` 整组消失）；混淆类 `f22.q`→`f32.q`、`a13.d0`→`i23.d0`。**「我的」页 / 设置项 / 桌面长按广告改为版本无关实现**；修掉「我的」页留空白与切 Tab 不刷新；修掉 `ShortcutManager` 类名写错导致长按图标广告栏不住 |
+| **`6.7.2.32`** | **`672`** | **v1.9.23** | ✅ **当前版本，实测通过** | 资源 id **没有平移**（13 个名字全部 `old == new`）但**含义变了**（`e4q` 从「我的资产」变成「快捷入口栏」，`br7`/`ej2`/`ce4` 整组消失）；混淆类 `f22.q`→`f32.q`、`a13.d0`→`i23.d0`。**「我的」页 / 设置项 / 桌面长按广告改为版本无关实现**；修掉「我的」页留空白与切 Tab 不刷新；修掉 `ShortcutManager` 类名写错导致长按图标广告栏不住 |
 | `6.7.1.32` | `671` | v1.9.20 | ✅ 实测通过（上一版，不再维护） | versionCode 仍是 671 ⇒ 混淆「名字表」未变，但**资源 id 数值整体平移**，需按新包重新提取；「我的」页换成新 id（`bpz`→`br7`、`e33`→`e4q`、`ccv`→`ce3`/`ce4`）。新增阅读页 OneStop 购物卡 / 章节末广告入口行 / 首页 VIP 促销全屏浮层 / 「我的」页四类入口的拦截 |
 | `6.7.1.16` | `671` | v1.9.10 | ✅ 实测通过（上一版，不再维护） | 16 个混淆类名 / 资源 id 全部复核存在；支持免登录；修复未登录时「我的」页头部消失 |
 | `6.6.7.32` | `667` | v1.9.4 / v1.9.5 | ✅ 实测通过（历史版本） | DialogFragment 广告弹窗拦截、广告文本实时过滤、听歌页广告按资源 id 精确隐藏 |
@@ -123,10 +123,16 @@ bash tools/adapt_new_version.sh --pull-tree --clear-dump   # 把 View 树拉到 
 - 全屏覆盖型广告自动检测与隐藏
 
 ### 弹窗拦截
-- 类名匹配：luckycat / 更新升级 / 广告弹窗
+- 类名匹配：luckycat / 更新升级 / 广告弹窗 / 会员促销（`Promo` `Promotion` `VipPromo` `VipPopup`）/ 广告解锁弹层（`admodule` `unlocktime`，对应 `com.dragon.read.admodule.adfm.unlocktime.ui.*` 共 8 个）
 - 内容匹配：「签到」「听歌领金币」「领取+金币」类弹窗自动关闭
 - **DialogFragment 拦截（v1.9.5）**：章节末「看小视频免30分钟广告」等广告弹窗是 DialogFragment（不走 `Dialog.show()`），hook `androidx.fragment.app.DialogFragment.show()` + 已知广告 Fragment 的 `onCreateView` 直接阻止渲染
 - **广告文本实时过滤**：hook `TextView.setText()`，广告文本被设置的瞬间即隐藏（覆盖 App 切换智能朗读/真人讲书等模式重建 View 的场景，零扫描零卡顿）
+- **服务端下发促销浮层（v1.9.22）**：听书页「仅限当前设备开通7天会员，限时有效」这类整块浮层是 Lynx/自绘 Dialog，**整层没有任何 `TextView`**、文案只挂在 View 的 `content-desc` 上，且文案不在 APK 内。改为扫整棵弹窗子树的 **`content-desc` + `text`**，并在 `Dialog.show` 后 **0/300/800/1600/2800 ms 多点重扫**（Lynx 异步渲染）。护栏**故意不做尺寸判定** —— 实测该弹层窗口 decor 是整屏 1080×2400 的透明壳，按尺寸判会把弹层当成整页而跳过；改靠**文案特异性**
+- **浮动窗兜底（v1.9.22）**：不是所有促销浮层都是 Dialog，有些直接往 `WindowManagerGlobal` 里 `addView`。hook `WindowManagerGlobal.addView`，只处理浮动类型窗口（`TYPE_APPLICATION` / panel / attachedDialog / overlay，**绝不碰 Activity 自身的窗口**），命中即整窗 `removeViewImmediate`（只设 `GONE` 不行：透明模态窗还在，会继续吃触摸，表现为界面「卡死」）
+- **Dialog 类名观测日志（v1.9.22）**：把每个真正 `show` 出来的 Dialog 类名记一次（去重），换版本后再遇到漏网弹窗，日志里直接就有类名
+
+### 语音广告拦截
+- **「XX金币已到账…」语音播报（v1.9.23）**：听书一段时间后突然冒出的语音广告是字节 **Polaris（增长/激励体系）** 下发的、**下载的 `.aac`**（不是 TTS）。在播放入口源码级短路：`com.bytedance.polaris.impl.voice.w.a|o` + `com.bytedance.polaris.impl.audio.AudioHelper.s|r|j`，且**只短路返回 `void` 的重载**（`boolean`/`String` 这类策略查询一律不碰，不会破坏调用方状态机）
 
 ### 广告拦截（v1.9.9 增强）
 - **听歌页贴片广告**：番茄的「贴片广告」由字节 Lynx（`com.ss.android.mannor`）模板渲染，装在 `MusicPatchAdContainer` 里，**没有固定资源 id**。模块改为**视觉层面**拦截：hook 该容器构造 + `View.setVisibility`，只置 `GONE`、绝不 `removeView`（`ViewStub` 只能 inflate 一次，remove 会抛异常），彻底消除「小视频 + 商家推荐 + 倒计时」广告卡
@@ -228,15 +234,22 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 ├── README.md                    ← 你正在看的
 ├── DISCLAIMER.md                ← 免责声明全文
 ├── CHANGELOG.md                 ← 版本历史
-├── RELEASE_NOTES_v1.9.20.md     ← 最新版发布说明（含适配版本 + 逐项拦截清单）
-├── RELEASE_NOTES_v1.9.10.md     ← 历史版本发布说明
-├── .github/workflows/build.yml  ← push 即自动打包 + 发布 Release
+├── RELEASE_NOTES_v1.9.23.md     ← 最新版发布说明（含适配版本 + 逐项拦截清单）
+├── REVERSE_ENGINEERING_v1.9.23.md ← 广告面逆向报告（规模统计 / 已封堵链路 / 刻意不封堵的）
+├── RELEASE_NOTES_v1.9.20.md     ← 历史版本发布说明
+├── .github/workflows/build.yml  ← push 即自动打包 + 发布 Release（主仓库 + 模块发布仓库）
+├── tools/                       ← 自研 dex 逆向工具（adscan / dexsig / dexfind / dexdump / dexdis）
 └── module/
     ├── src/                     ← Java 源码（MainHook.java + Xposed stub）
     ├── build.sh                 ← 手机端构建脚本（Termux 工具链，需 root）
     ├── build_local.sh           ← 宿主机本地构建脚本（**不需要 root，推荐**）
     └── out/module.apk           ← 成品
 ```
+
+> ⚠️ `build_local.sh` 需要仓库根目录至少有一个 `fanqie-enhance-v*.apk` 当**模板**
+> （本模块自己没有资源，模板只提供图标 / `assets/xposed_init` 等资产 + 清单骨架）。
+> 它会按版本号取最大的那个，取不到就回退 `fanqie-enhance-v1.9.20.apk`。
+> **删这些模板包会让 CI 构建直接失败**，别顺手清理。
 
 ## 许可证
 
