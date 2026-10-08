@@ -169,6 +169,8 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 - **做法**：编译 → d8 出 `classes.dex` → 替换进**上一版已签名 APK**（保留其资源与清单，省掉 aapt2 重打包）→ 就地补丁二进制清单里的 `versionCode`/`versionName` → 用**同一个 keystore** 重新做 v1+v2 签名，所以能直接 `adb install -r` 覆盖安装
 - **可覆盖的环境变量**：`ANDROID_JAR` / `R8_JAR` / `APKSIG_JAR` / `BCPROV_JAR` / `BCPKIX_JAR` / `TEMPLATE_APK`（上一版模块 APK，须与本机安装的是同一签名）/ `KEYSTORE` / `WORK`
 - 仓库里附带的 `fanqie-enhance-*.apk` 既是成品，也是下一次构建的 `TEMPLATE_APK`
+- **模板按版本号取最大的那个**：当前是 `fanqie-enhance-v1.9.23.apk` —— 开发机实测通过的那一版，作为**产物基准**
+- ⚠️ **本地产物与 CI 产物不一定是同一个二进制**：`--lib android.jar` 不同 —— 本地默认用 Gradle 缓存里那个**裁剪版**（不含 `java.lang.*` 桩），CI 用官方 platform-34 的**完整版**。d8 因此做出等价的编码选择差异（`filled-new-array` vs `new-array` + `aput-object`、`invokeinterface CharSequence.toString()` vs `invokevirtual Object.toString()`），dex 会差几百字节。两者**功能完全等价**（类 / 方法 / 字符串 / 字段完全相同，只差 1 条 method 引用），但 sha256 不同。若要逐字节复现 CI 产物，把 `ANDROID_JAR` 指向官方 platform-34 的 `android.jar`
 
 ### 方式二：手机端 Termux 工具链（仅作备用）
 
@@ -248,7 +250,8 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 
 > ⚠️ `build_local.sh` 需要仓库根目录至少有一个 `fanqie-enhance-v*.apk` 当**模板**
 > （本模块自己没有资源，模板只提供图标 / `assets/xposed_init` 等资产 + 清单骨架）。
-> 它会按版本号取最大的那个，取不到就回退 `fanqie-enhance-v1.9.20.apk`。
+> 它会按版本号取最大的那个（当前 = `fanqie-enhance-v1.9.23.apk`，开发机实测通过的构建），
+> 取不到就回退 `fanqie-enhance-v1.9.20.apk`。
 > **删这些模板包会让 CI 构建直接失败**，别顺手清理。
 
 ## 许可证
