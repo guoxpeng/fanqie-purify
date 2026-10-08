@@ -171,28 +171,36 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 - 仓库里附带的 `fanqie-enhance-*.apk` 既是成品，也是下一次构建的 `TEMPLATE_APK`
 - **模板按版本号取最大的那个**：当前是 `fanqie-enhance-v1.9.23.apk` —— 开发机实测通过的那一版，作为**产物基准**
 - ⚠️ **本地产物与 CI 产物不一定是同一个二进制**：`--lib android.jar` 不同 —— 本地默认用 Gradle 缓存里那个**裁剪版**（不含 `java.lang.*` 桩），CI 用官方 platform-34 的**完整版**。d8 因此做出等价的编码选择差异（`filled-new-array` vs `new-array` + `aput-object`、`invokeinterface CharSequence.toString()` vs `invokevirtual Object.toString()`），dex 会差几百字节。两者**功能完全等价**（类 / 方法 / 字符串 / 字段完全相同，只差 1 条 method 引用），但 sha256 不同。若要逐字节复现 CI 产物，把 `ANDROID_JAR` 指向官方 platform-34 的 `android.jar`
+- 正因为这个差异，**对外发布的永远是仓库里这份本地构建的模板包**，不是 CI 现场编译的产物（见下文方式三）
 
 ### 方式二：手机端 Termux 工具链（仅作备用）
 
 `module/build.sh` 依赖手机上的 `/data/local/tmp/fuck_andes/tool/TERMUX`（`root:root 700`，必须 root 才能用）。换应用版本做适配时它更方便 —— 可以直接在手机上 `aapt2 dump resources` 提取新包的资源 id。
 
-### 方式三：GitHub Actions 自动打包 / 自动发布
+### 方式三：GitHub Actions 校验 + 自动发布
 
 工作流在 [`.github/workflows/build.yml`](.github/workflows/build.yml)，**push 到 `main` 即自动完成全部动作**：
 
 1. 装 JDK 21 → 取 `android.jar`（优先用 runner 自带的 Android SDK，取不到才下官方 platform 包）→ 拉 `r8`/`apksig`/`bouncycastle`
-2. 调用 `module/build_local.sh` 出包（用仓库里当前这版 APK 当模板，签名密钥从 secret 注入）
-3. 校验产物（包内有 `classes.dex` / `AndroidManifest.xml`）→ 上传 workflow artifact
+2. **校验发布包**：确认仓库根目录里的 `fanqie-enhance-v{versionName}.apk` 存在，且其二进制清单里的 `versionName`/`versionCode` 与 `module/AndroidManifest.xml` 完全一致，并且含 `classes.dex` 与 v1 签名块（用 [`tools/apkver.py`](tools/apkver.py)）。任何一条不过就**直接失败**
+3. 调 `module/build_local.sh` 出包 —— **只作为「源码还能编过」的验证**，产物叫 `ci-rebuild-*.apk`，只进 workflow artifact，**不发布**
 4. tag 为 `{versionCode}-{versionName}`：**Release 不存在就建，存在就覆盖资产**，同时同步
-   [`Xposed-Modules-Repo/com.eta.fanqie.enhance`](https://github.com/Xposed-Modules-Repo/com.eta.fanqie.enhance)（Vector / LSPosed 读取的发布仓库）
+   [`Xposed-Modules-Repo/com.eta.fanqie.enhance`](https://github.com/Xposed-Modules-Repo/com.eta.fanqie.enhance)（Vector / LSPosed 读取的发布仓库），主仓库与发布仓库**两边都带 `.sha256`**
 
-所以**升版本只要改 `module/AndroidManifest.xml` 里的 `versionCode`/`versionName` 然后 push**，Release 与发布仓库会自动跟上；只改文档也会重新构建并把同一版本号的 Release 资产刷新成最新构建。
+> ★ **发布包 = 仓库里那份模板 APK**，也就是你本地构建、真机验证通过后提交进来的那一份。
+> CI 不拿自己现场编译的产物去发布 —— 它用的是 runner 自带的官方 `android.jar`，
+> d8 在拿到完整 `java.*` 桩时会选不同的等价编码，产物字节跟本地那份对不上。
+>
+> 所以**发新版的正确顺序**：改代码 → 升 `module/AndroidManifest.xml` 的
+> `versionCode`/`versionName` → 本地 `bash module/build_local.sh` → 真机验证 →
+> 把 `module-local.apk` 改名成 `fanqie-enhance-v{versionName}.apk` 提交进仓库 → push。
+> 漏了最后一步，CI 会在第 2 步直接失败（这是故意的：宁可失败，也不发一个没人验证过的包）。
 
 需要的仓库 secrets（Settings → Secrets and variables → Actions，已配置）：
 
 | Secret | 作用 | 缺失时 |
 |---|---|---|
-| `MODULE_KEYSTORE_BASE64` | 模块签名 keystore（`module.keystore`）的 base64 | 用临时密钥签名 → 产物**不能覆盖安装**，且跳过 Release 发布 |
+| `MODULE_KEYSTORE_BASE64` | 模块签名 keystore（`module.keystore`）的 base64 | 只影响第 3 步那个**不发布**的编译验证产物（改用临时密钥签名）；**不影响发布**，发布包自带签名 |
 | `RELEASE_REPO_TOKEN` | 对发布仓库有写权限的 PAT | 跳过发布仓库同步 |
 
 > 本模块的版本号（`1.9.x`）与番茄的版本号（`6.7.1.32`）是**两套独立编号**，不要混淆。
@@ -240,7 +248,7 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 ├── REVERSE_ENGINEERING_v1.9.23.md ← 广告面逆向报告（规模统计 / 已封堵链路 / 刻意不封堵的）
 ├── RELEASE_NOTES_v1.9.20.md     ← 历史版本发布说明
 ├── .github/workflows/build.yml  ← push 即自动打包 + 发布 Release（主仓库 + 模块发布仓库）
-├── tools/                       ← 自研 dex 逆向工具（adscan / dexsig / dexfind / dexdump / dexdis）
+├── tools/                       ← 工具脚本（apkver 版本校验 / adscan / dexsig / dexfind / dexdump / dexdis）
 └── module/
     ├── src/                     ← Java 源码（MainHook.java + Xposed stub）
     ├── build.sh                 ← 手机端构建脚本（Termux 工具链，需 root）
@@ -248,11 +256,13 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
     └── out/module.apk           ← 成品
 ```
 
-> ⚠️ `build_local.sh` 需要仓库根目录至少有一个 `fanqie-enhance-v*.apk` 当**模板**
+> ⚠️ 仓库根目录的 `fanqie-enhance-v*.apk` 有**两个身份**：既是发布出去的成品，也是下一次构建的模板
 > （本模块自己没有资源，模板只提供图标 / `assets/xposed_init` 等资产 + 清单骨架）。
-> 它会按版本号取最大的那个（当前 = `fanqie-enhance-v1.9.23.apk`，开发机实测通过的构建），
-> 取不到就回退 `fanqie-enhance-v1.9.20.apk`。
-> **删这些模板包会让 CI 构建直接失败**，别顺手清理。
+> `build_local.sh` 默认按版本号取最大的那个当模板；CI 则**显式指定「本次要发布的那一版」**当模板。
+>
+> **当前版本对应的那个包（现在是 `fanqie-enhance-v1.9.23.apk`）绝对不能删** ——
+> 它是对外分发的那个二进制，删了 CI 的「校验发布包」会直接失败。
+> 更早的历史版本包删掉只影响「本地构建时挑不到旧模板」，CI 不受影响。
 
 ## 许可证
 

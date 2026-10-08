@@ -41,8 +41,14 @@ tools/*
 !tools/adapt_new_version.sh
 !tools/adscan.py
 !tools/dexsig.py
+# apkver.py：CI 发布前用它校验「仓库模板 APK」的 versionName/versionCode，必须入库
+!tools/apkver.py
 
 # ===== 工作记忆（本地） =====
 .workbuddy-ai/
 MODULE_MEMORY.md
 /module-local.apk
+# CI 里「只验证源码能编译」的重编译产物（不作为发布包，见 .github/workflows/build.yml）
+/ci-rebuild-*.apk
+# Release 的 sha256 校验文件由 CI 现场生成，不入库
+/fanqie-enhance-v*.apk.sha256

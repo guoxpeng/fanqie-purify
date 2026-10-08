@@ -1,14 +1,24 @@
 name: 自动打包 / 发布
 
 # 自动化目标：改完代码只 push 一次，剩下的全自动。
-#   push 到 main  → 构建模块 APK（用仓库里上一版 APK 当资源模板 + 重签）→ 上传 workflow artifact
-#                    → 若对应的 Release 不存在就建 tag「{versionCode}-{versionName}」并发布，存在就覆盖资产
+#   push 到 main  → 校验仓库里的「模板 APK」→ 发布 Release（tag「{versionCode}-{versionName}」，
+#                    已存在就覆盖资产）→ 同步到 Vector / LSPosed 模块发布仓库
 #   push tag      → 同上，Release 用该 tag
-#   手动触发      → 只构建 + 上传 artifact（不发布）
+#   手动触发 / PR → 只做校验 + 编译验证，不发布、不同步
+#
+# ★ 发布包是谁：仓库根目录里的 `fanqie-enhance-v{versionName}.apk`，
+#   也就是开发者本地跑 module/build_local.sh 构建、真机验证通过后提交进来的那一份。
+#   CI 不会拿自己现场编译的产物去发布 —— CI 用的是 runner 自带的官方 android.jar，
+#   d8 在拿到完整 java.* 桩时会选不同的等价编码（filled-new-array / invokeinterface …），
+#   产物字节与本地那份对不上。所以 CI 的编译只作为「源码还能编过」的验证，
+#   产物叫 ci-rebuild-*.apk，只进 workflow artifact，不发布。
+#   发新版前必须先把本地构建并真机验证过的 APK 提交进仓库，否则本工作流会在
+#   「校验发布包」这步直接失败（这是故意的，宁可失败也不发出一个没人验证过的包）。
 #
 # 需要的 secrets（Settings → Secrets and variables → Actions）：
 #   MODULE_KEYSTORE_BASE64  模块签名 keystore（/data/local/tmp/fuck_andes/module/module.keystore）的 base64
-#                           ★ 没有它构建出来的包用临时密钥签名、不能覆盖安装，也会跳过 Release 发布
+#                           ★ 只用于给上面的编译验证产物签名（那份不发布），
+#                             缺了不影响发布 —— 发布包自带签名，来自仓库里的模板 APK
 #   RELEASE_REPO_TOKEN      对 Xposed-Modules-Repo/com.eta.fanqie.enhance 有写权限的 PAT（可选）
 #                           配了就会同步发布仓库的文件并建对应的 Release
 #
@@ -92,9 +102,43 @@ jobs:
           echo "versionCode=$VC"  >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
           echo "apk=fanqie-enhance-v$VN.apk" >> "$GITHUB_OUTPUT"
-          echo "版本 $VN ($VC) → tag $TAG"
+          echo "版本 $VN ($VC) → tag $TAG，发布包 = fanqie-enhance-v$VN.apk（仓库里的模板）"
 
-      - name: 准备签名密钥
+      # 发布包就是仓库里那份模板 APK。这里做三道校验，任何一道不过就直接失败：
+      #   1. 文件存在（发新版忘了提交本地构建的 APK → 在这里拦住）
+      #   2. 二进制清单里的 versionName/versionCode 与 module/AndroidManifest.xml 完全一致
+      #      （防止提交了旧版本 / 手改错的包）
+      #   3. 有 classes.dex + v1 签名块（用户要能覆盖安装）
+      - name: 校验发布包（仓库模板 APK）
+        run: |
+          set -euo pipefail
+          APK="${{ steps.ver.outputs.apk }}"
+          VN="${{ steps.ver.outputs.versionName }}"
+          VC="${{ steps.ver.outputs.versionCode }}"
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::找不到发布包 $APK"
+            echo "::error::本仓库发布的是「仓库里那份真机验证过的 APK」，不是 CI 现场编译的产物。"
+            echo "::error::请先在本地跑 module/build_local.sh，真机验证通过后把它提交进仓库（文件名必须是 $APK），再发版。"
+            exit 1
+          fi
+
+          python3 tools/apkver.py "$APK" --expect-name "$VN" --expect-code "$VC"
+
+          unzip -l "$APK" | tee /tmp/tpllist.txt
+          grep -q "classes.dex" /tmp/tpllist.txt \
+            || { echo "::error::$APK 里没有 classes.dex"; exit 1; }
+          grep -q "AndroidManifest.xml" /tmp/tpllist.txt \
+            || { echo "::error::$APK 里没有 AndroidManifest.xml"; exit 1; }
+          grep -qE 'META-INF/.*\.(RSA|DSA|EC)' /tmp/tpllist.txt \
+            || { echo "::error::$APK 没有 v1 签名块，用户无法覆盖安装"; exit 1; }
+          unzip -p "$APK" AndroidManifest.xml | strings -el | grep -E "com\.xs\.fm" || true
+
+          echo "--- 签名证书（必须与历史版本一致，否则老用户覆盖安装会签名冲突）---"
+          # 强制英文输出，免得 keytool 跟着 runner 的 locale 变（中文 JDK 打的是「所有者:」）
+          keytool -J-Duser.language=en -printcert -jarfile "$APK" | grep -E "SHA256:" || true
+
+      - name: 准备签名密钥（只给下面的编译验证产物用）
         id: ks
         run: |
           set -euo pipefail
@@ -103,16 +147,18 @@ jobs:
             printf '%s' "${{ secrets.MODULE_KEYSTORE_BASE64 }}" | base64 -d > "$KS"
             test -s "$KS"
             echo "official=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 使用仓库密钥签名（产物可直接覆盖安装）"
+            echo "✅ 编译验证产物将用仓库密钥签名"
           else
             keytool -genkeypair -keystore "$KS" -alias module -keyalg RSA -keysize 2048 \
               -validity 10000 -storepass android -keypass android \
               -dname "CN=FanqieEnhance-CI" > /dev/null 2>&1
             echo "official=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::未配置 MODULE_KEYSTORE_BASE64，本次用临时密钥签名，产物仅供测试，也不会发布 Release"
+            echo "::warning::未配置 MODULE_KEYSTORE_BASE64，编译验证产物用临时密钥签名（不影响发布，发布包来自仓库模板）"
           fi
 
-      - name: 构建模块 APK
+      # 只验证「源码还能编过」，产物不发布。显式指定 TEMPLATE_APK = 本次要发布的那份，
+      # 保证编译验证的输入与发布产物同源。
+      - name: 构建模块 APK（仅验证源码可编译，不作发布包）
         run: |
           set -euo pipefail
           export WORK="$RUNNER_TEMP/build"
@@ -122,19 +168,20 @@ jobs:
           export BCPROV_JAR="$PWD/deps/bcprov.jar"
           export BCPKIX_JAR="$PWD/deps/bcpkix.jar"
           export KEYSTORE="$RUNNER_TEMP/module.keystore"
+          export TEMPLATE_APK="$PWD/${{ steps.ver.outputs.apk }}"
           bash module/build_local.sh
-          mv module-local.apk "${{ steps.ver.outputs.apk }}"
-          sha256sum "${{ steps.ver.outputs.apk }}" > "${{ steps.ver.outputs.apk }}.sha256"
-          ls -la ./*.apk ./*.sha256
+          mv module-local.apk "ci-rebuild-${{ steps.ver.outputs.versionName }}.apk"
+          echo "--- 编译验证产物（不发布，仅作对比）---"
+          sha256sum "ci-rebuild-${{ steps.ver.outputs.versionName }}.apk"
+          echo "--- 实际发布包（仓库模板）---"
+          sha256sum "${{ steps.ver.outputs.apk }}"
 
-      - name: 校验 APK（包内清单 / dex 存在）
+      - name: 生成发布校验文件
         run: |
           set -euo pipefail
           APK="${{ steps.ver.outputs.apk }}"
-          unzip -l "$APK" | tee /tmp/apklist.txt
-          grep -q "classes.dex" /tmp/apklist.txt
-          grep -q "AndroidManifest.xml" /tmp/apklist.txt
-          unzip -p "$APK" AndroidManifest.xml | strings -el | grep -E "com\.xs\.fm" || true
+          sha256sum "$APK" > "$APK.sha256"
+          cat "$APK.sha256"
 
       - name: 上传构建产物（artifact）
         uses: actions/upload-artifact@v4
@@ -143,6 +190,7 @@ jobs:
           path: |
             ${{ steps.ver.outputs.apk }}
             ${{ steps.ver.outputs.apk }}.sha256
+            ci-rebuild-${{ steps.ver.outputs.versionName }}.apk
           if-no-files-found: error
 
       # 注意：不能用 secrets 做 step 级 if（GitHub 会报 Unrecognized named-value: 'secrets'），
@@ -153,10 +201,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "${{ steps.ks.outputs.official }}" != "true" ]; then
-            echo "::notice::未配置签名密钥，跳过 Release 发布"
-            exit 0
-          fi
           APK="${{ steps.ver.outputs.apk }}"
           TAG="${{ steps.ver.outputs.tag }}"
           VN="${{ steps.ver.outputs.versionName }}"
@@ -177,7 +221,7 @@ jobs:
           fi
 
       - name: 同步模块发布仓库（Vector / LSPosed）
-        if: steps.ks.outputs.official == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
         run: |
@@ -201,17 +245,18 @@ jobs:
           git push
           cd ..
 
-          # 发布仓库的 Release：资产名沿用历史约定 Fanqie-Purify_vX.Y.Z.apk
+          # 发布仓库的 Release：资产名沿用历史约定 Fanqie-Purify_vX.Y.Z.apk，附带同名 .sha256
           cp "$APK" "Fanqie-Purify_v${VER}.apk"
           ASSET="Fanqie-Purify_v${VER}.apk"
+          sha256sum "$ASSET" > "$ASSET.sha256"
           if gh release view "$TAG" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" --repo "$RELEASE_REPO" --clobber
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --clobber
           elif [ -f "RELEASE_NOTES_v${VER}.md" ]; then
-            gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --target main \
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --target main \
               --notes-file "RELEASE_NOTES_v${VER}.md" \
-              || gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --verify-tag \
+              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --verify-tag \
                    --notes-file "RELEASE_NOTES_v${VER}.md"
           else
-            gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --target main --generate-notes \
-              || gh release create "$TAG" "$ASSET" --repo "$RELEASE_REPO" --title "$VER" --verify-tag --generate-notes
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --target main --generate-notes \
+              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --verify-tag --generate-notes
           fi
