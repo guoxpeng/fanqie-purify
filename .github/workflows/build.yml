@@ -97,7 +97,11 @@ jobs:
           set -euo pipefail
           VN=$(python3 -c "import re;print(re.search(r'versionName=\"([^\"]+)\"',open('module/AndroidManifest.xml',encoding='utf-8').read()).group(1))")
           VC=$(python3 -c "import re;print(re.search(r'versionCode=\"(\d+)\"',open('module/AndroidManifest.xml',encoding='utf-8').read()).group(1))")
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG="${GITHUB_REF_NAME}"; else TAG="${VC}-${VN}"; fi
+          # 统一用 v{versionName} 作为发布 tag（不再按触发方式二选一）。
+          # 以前 tag 触发时用 ref 名、main 触发时用 {versionCode}-{versionName}，
+          # 结果同一次发版会产出两个 Release（v1.9.30 与 193000-1.9.30），
+          # 而且两个的说明都是自动生成的空壳。
+          TAG="v${VN}"
           echo "versionName=$VN"  >> "$GITHUB_OUTPUT"
           echo "versionCode=$VC"  >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
@@ -207,7 +211,11 @@ jobs:
           NOTES="RELEASE_NOTES_v${VN}.md"
           if [ -f "$NOTES" ]; then NOTES_ARGS=(--notes-file "$NOTES"); else NOTES_ARGS=(--generate-notes); fi
           if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "Release $TAG 已存在 → 覆盖资产"
+            echo "Release $TAG 已存在 → 同步说明 + 覆盖资产"
+            # 说明也要跟着源码走：以前只 --clobber 资产，正文永远停在第一次创建时的样子
+            if [ -f "$NOTES" ]; then
+              gh release edit "$TAG" --title "v${VN}" --notes-file "$NOTES"
+            fi
             gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
           else
             # tag 触发时 tag 一定存在（--verify-tag）；main 触发时由 gh 建 tag（--target main）。
@@ -237,7 +245,16 @@ jobs:
           # 发布仓库只保留当前版本 APK，历史版本由 Releases 承载
           rm -f rel/fanqie-enhance-v*.apk rel/*.sha256 rel/Fanqie-Purify_v*.apk
           cp "$APK" "$APK.sha256" rel/
-          cp README.md rel/ 2>/dev/null || true
+          # 源码/清单也要一起同步：发布仓库的根目录布局（Xposed-Modules-Repo 约定）
+          # 就是 module/ 的内容。以前这里只 cp 了 APK + README，导致根目录的
+          # AndroidManifest.xml / src 永远停在旧版本，和 APK 版本对不上。
+          cp module/AndroidManifest.xml rel/
+          cp module/build.sh module/build_local.sh rel/
+          rsync -a --delete module/src/ rel/src/
+          rsync -a --delete module/assets/ rel/assets/
+          rsync -a --delete --exclude .git module/ rel/module/
+          cp CHANGELOG.md README.md rel/ 2>/dev/null || true
+          rsync -a --delete tools/ rel/tools/
           cd rel
           git add -A
           git -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
