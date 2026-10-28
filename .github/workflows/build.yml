@@ -269,6 +269,8 @@ jobs:
           rsync -a --delete module/assets/ rel/assets/
           rsync -a --delete --exclude .git module/ rel/module/
           cp CHANGELOG.md README.md rel/ 2>/dev/null || true
+          # 发行说明也一起带过去：发布仓根目录历来存着各版本 RELEASE_NOTES_vX.Y.Z.md
+          cp RELEASE_NOTES_v*.md rel/ 2>/dev/null || true
           rsync -a --delete tools/ rel/tools/
           cd rel
           git add -A
