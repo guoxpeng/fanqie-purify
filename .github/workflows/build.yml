@@ -101,12 +101,20 @@ jobs:
           # 以前 tag 触发时用 ref 名、main 触发时用 {versionCode}-{versionName}，
           # 结果同一次发版会产出两个 Release（v1.9.30 与 193000-1.9.30），
           # 而且两个的说明都是自动生成的空壳。
+          #
+          # ⚠️ 但发布仓库（Xposed-Modules-Repo）必须用 **{versionCode}-{versionName}**！
+          #    那个组织有自动化校验，Release 的 tag 不符合 `数字-版本号` 格式时，
+          #    会在创建/更新后 ~20 秒把它**静默转回草稿**（published_at 保留，看起来像成功了）。
+          #    实测：tag=v1.9.30 时每次转正都被打回、/releases/latest 一直停在旧版；
+          #    改成 193000-1.9.30 后立刻稳定。所以两个仓库用两个 tag，见 rel_tag。
           TAG="v${VN}"
+          REL_TAG="${VC}-${VN}"
           echo "versionName=$VN"  >> "$GITHUB_OUTPUT"
           echo "versionCode=$VC"  >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "rel_tag=$REL_TAG"  >> "$GITHUB_OUTPUT"
           echo "apk=fanqie-enhance-v$VN.apk" >> "$GITHUB_OUTPUT"
-          echo "版本 $VN ($VC) → tag $TAG，发布包 = fanqie-enhance-v$VN.apk（仓库里的模板）"
+          echo "版本 $VN ($VC) → 主仓 tag $TAG / 发布仓 tag $REL_TAG，发布包 = fanqie-enhance-v$VN.apk（仓库里的模板）"
 
       # 发布包就是仓库里那份模板 APK。这里做三道校验，任何一道不过就直接失败：
       #   1. 文件存在（发新版忘了提交本地构建的 APK → 在这里拦住）
@@ -209,39 +217,55 @@ jobs:
           TAG="${{ steps.ver.outputs.tag }}"
           VN="${{ steps.ver.outputs.versionName }}"
           NOTES="RELEASE_NOTES_v${VN}.md"
-          if [ -f "$NOTES" ]; then NOTES_ARGS=(--notes-file "$NOTES"); else NOTES_ARGS=(--generate-notes); fi
-          # ⚠️ 不能用 releases/tags/$TAG 判存在：GitHub 的这个端点**不返回草稿**（草稿只出现在列表接口里），
-          #    一旦某个 Release 处在草稿态，就会「查不到 → 再建一个 → 又多一个草稿」无限套娃。
-          #    这里统一走列表接口按 tag_name 找 id，再用 id PATCH（草稿也能被查到/转正）。
-          RID=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-                  --jq "map(select(.tag_name==\"${TAG}\")) | .[0].id" 2>/dev/null || echo "")
-          if [ "${RID:-null}" = "null" ]; then RID=""; fi
+          BODY=""
+          if [ -f "$NOTES" ]; then BODY=$(cat "$NOTES"); fi
+
+          # ⚠️ 三条必须遵守的规则，全部实测复现过：
+          #  ① `GET/PATCH repos/{repo}/releases/tags/{tag}` **不返回草稿**，而且这个端点
+          #     没有 PATCH 语义（改 Release 必须用 release id）。以前那句「强制转正」一直是
+          #     404 被 `|| true` 吞掉，所以从来没生效过。
+          #  ② `gh release create --target main` 在 tag 已存在时会把 Release 建成**草稿**。
+          #  ③ 主仓对 tag 格式没有限制（v1.9.30 正常），但**发布仓库有**（必须 193000-1.9.30），
+          #     详见下面「同步模块发布仓库」步骤的说明 —— 那里的 Release 会被静默打回草稿。
+          #     为了两边行为一致，这里草稿态一律「删掉重建」而不是 PATCH 转正。
+          state() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq "map(select(.tag_name==\"${TAG}\")) | .[0] | \"\(.id) \(.draft)\"" 2>/dev/null || echo ""
+          }
+          read -r RID RDRAFT <<< "$(state)"
+          if [ "${RID:-null}" = "null" ]; then RID=""; RDRAFT=""; fi
+
+          if [ -n "$RID" ] && [ "${RDRAFT}" = "true" ]; then
+            echo "Release $TAG 处于草稿态 (id=$RID) → 删除后以 published 重建"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${RID}" > /dev/null
+            RID=""
+          fi
+
           if [ -n "$RID" ]; then
-            echo "Release $TAG 已存在 (id=$RID) → 同步说明 + 覆盖资产"
+            echo "Release $TAG 已发布 (id=$RID) → 覆盖资产 + 同步说明"
             gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RID}" \
+              -f name="v${VN}" -f body="$BODY" -F draft=false -F make_latest=true > /dev/null
           else
-            # tag 已存在就用 --verify-tag（--target 在 tag 已存在时会把 Release 建成草稿）；
-            # tag 还不存在（main 推送发版）才用 --target main 让 gh 现场建 tag。
-            if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" > /dev/null 2>&1 \
-               || [[ "$GITHUB_REF" == refs/tags/* ]]; then
-              gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --verify-tag "${NOTES_ARGS[@]}"
+            echo "Release $TAG 不存在 → POST 直接创建为 published"
+            if [ -n "$BODY" ]; then
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+                -f tag_name="$TAG" -f target_commitish=main -f name="v${VN}" \
+                -f body="$BODY" -F draft=false -F prerelease=false -f make_latest=true > /dev/null
             else
-              gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --target main "${NOTES_ARGS[@]}"
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+                -f tag_name="$TAG" -f target_commitish=main -f name="v${VN}" \
+                -F draft=false -F prerelease=false -f make_latest=true > /dev/null
             fi
-            RID=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-                    --jq "map(select(.tag_name==\"${TAG}\")) | .[0].id" 2>/dev/null || echo "")
-            if [ "${RID:-null}" = "null" ]; then RID=""; fi
+            gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
           fi
-          # 兜底：同步说明 + 强制转正 + 标最新（按 id，草稿也能改）
-          if [ -n "$RID" ]; then
-            if [ -f "$NOTES" ]; then
-              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RID}" \
-                -f name="v${VN}" -f body="$(cat "$NOTES")" -F draft=false -F make_latest=true > /dev/null || true
-            else
-              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${RID}" \
-                -F draft=false -F make_latest=true > /dev/null || true
-            fi
-          fi
+
+          # 收尾自检：最终必须真的是 published，否则让这次 CI 红
+          FINAL=$(state)
+          echo "最终状态 (id draft): ${FINAL}"
+          case "$FINAL" in
+            *" true") echo "::error::Release $TAG 仍是草稿"; exit 1 ;;
+          esac
 
       - name: 同步模块发布仓库（Vector / LSPosed）
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
@@ -255,7 +279,8 @@ jobs:
           fi
           APK="${{ steps.ver.outputs.apk }}"
           VER="${{ steps.ver.outputs.versionName }}"
-          TAG="${{ steps.ver.outputs.tag }}"
+          # ⚠️ 发布仓必须用 {versionCode}-{versionName} 格式的 tag（见上面「读取版本号」步骤的说明）
+          TAG="${{ steps.ver.outputs.rel_tag }}"
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${RELEASE_REPO}.git" rel
           # 发布仓库只保留当前版本 APK，历史版本由 Releases 承载
           rm -f rel/fanqie-enhance-v*.apk rel/*.sha256 rel/Fanqie-Purify_v*.apk
@@ -281,59 +306,58 @@ jobs:
 
           # 发布仓库的 Release：资产名沿用历史约定 Fanqie-Purify_vX.Y.Z.apk，附带同名 .sha256
           #
-          # ⚠️ 踩过的两个坑（v1.9.30 在发布仓库连出两个草稿、/releases/latest 停在 1.9.29）：
-          #   ① `gh release create --target main` 在 tag 已存在时会把 Release 建成**草稿**
-          #      （tag_name 变成 untagged-xxxx），而草稿不出现在 Releases 列表，也不被 latest 选中；
-          #   ② `GET/PATCH repos/{repo}/releases/tags/{tag}` 这个端点**不返回草稿**，
-          #      而且它没有 PATCH 语义 —— 之前那句 PATCH 一直是 404 被 `|| true` 吞掉，
-          #      所以「强制转正」从来没生效过。
-          #   正确做法：先把 tag 推到发布仓库 → 用**列表接口**按 tag_name 找 release id →
-          #      不存在才 create（--verify-tag，避免草稿化）→ 存在就按 id 覆盖资产 +
-          #      PATCH id 转正/标最新（草稿也能被 id 改到）。
+          # ⚠️ 踩过的坑（全部实测复现）：
+          #  ① `gh release create --target main` 在 tag 已存在时会把 Release 建成**草稿**；
+          #  ② `GET/PATCH .../releases/tags/{tag}` 不返回草稿，且没有 PATCH 语义（必须用 id）；
+          #  ③ **真正的大坑**：这个组织要求 tag 是 `{versionCode}-{versionName}`（193000-1.9.30）。
+          #     用 `v1.9.30` 这种格式时，任何一次写入（创建/上传资产/PATCH）之后约 20 秒，
+          #     Release 都会被**静默转回草稿**，published_at 却保留着 ——
+          #     表现就是「刚发布成功，过一会儿 /releases/latest 又退回旧版本」，怎么修都修不好。
+          #     换成 193000-1.9.30 后立刻稳定，所以下面 TAG 取的是 rel_tag。
+          #  ④ 兜底：草稿态不要试图 PATCH 转正（会被 ③ 打回），直接删掉用 POST 重建。
           cp "$APK" "Fanqie-Purify_v${VER}.apk"
           ASSET="Fanqie-Purify_v${VER}.apk"
           sha256sum "$ASSET" > "$ASSET.sha256"
           NOTES_FILE="RELEASE_NOTES_v${VER}.md"
+          BODY=""
+          if [ -f "$NOTES_FILE" ]; then BODY=$(cat "$NOTES_FILE"); fi
 
-          # 先推 tag（--verify-tag 要求远端已有该 tag，否则 gh 会现场建 tag 并草稿化 Release）
-          git -C rel push origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
-
-          rid() {
+          state() {
             gh api "repos/${RELEASE_REPO}/releases?per_page=100" \
-              --jq "map(select(.tag_name==\"${TAG}\")) | .[0].id" 2>/dev/null || echo ""
+              --jq "map(select(.tag_name==\"${TAG}\")) | .[0] | \"\(.id) \(.draft)\"" 2>/dev/null || echo ""
           }
-          RID=$(rid)
-          if [ "${RID:-null}" = "null" ]; then RID=""; fi
+          read -r RID RDRAFT <<< "$(state)"
+          if [ "${RID:-null}" = "null" ]; then RID=""; RDRAFT=""; fi
+
+          if [ -n "$RID" ] && [ "${RDRAFT}" = "true" ]; then
+            echo "Release $TAG 处于草稿态 (id=$RID) → 删除后以 published 重建"
+            gh api -X DELETE "repos/${RELEASE_REPO}/releases/${RID}" > /dev/null
+            RID=""
+          fi
 
           if [ -n "$RID" ]; then
-            echo "Release $TAG 已存在 (id=$RID) → 覆盖资产"
+            echo "Release $TAG 已发布 (id=$RID) → 覆盖资产 + 同步说明"
             gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --clobber
+            gh api -X PATCH "repos/${RELEASE_REPO}/releases/${RID}" \
+              -f name="v${VER}" -f body="$BODY" -F draft=false -F make_latest=true > /dev/null
           else
-            echo "Release $TAG 不存在 → 创建"
-            if [ -f "$NOTES_FILE" ]; then
-              gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" \
-                --verify-tag --notes-file "$NOTES_FILE"
+            echo "Release $TAG 不存在 → POST 直接创建为 published"
+            if [ -n "$BODY" ]; then
+              gh api -X POST "repos/${RELEASE_REPO}/releases" \
+                -f tag_name="$TAG" -f target_commitish=main -f name="v${VER}" \
+                -f body="$BODY" -F draft=false -F prerelease=false -f make_latest=true > /dev/null
             else
-              gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" \
-                --verify-tag --generate-notes
+              gh api -X POST "repos/${RELEASE_REPO}/releases" \
+                -f tag_name="$TAG" -f target_commitish=main -f name="v${VER}" \
+                -F draft=false -F prerelease=false -f make_latest=true > /dev/null
             fi
-            RID=$(rid)
-            if [ "${RID:-null}" = "null" ]; then RID=""; fi
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --clobber
           fi
 
-          # 兜底：按 id 同步说明 + 强制转正 + 标为 latest
-          # （草稿既不出现在 Releases 列表，也不会被 /releases/latest 选中）
-          if [ -n "$RID" ]; then
-            if [ -f "$NOTES_FILE" ]; then
-              gh api -X PATCH "repos/${RELEASE_REPO}/releases/${RID}" \
-                -f name="v${VER}" -f body="$(cat "$NOTES_FILE")" \
-                -F draft=false -F make_latest=true > /dev/null
-            else
-              gh api -X PATCH "repos/${RELEASE_REPO}/releases/${RID}" \
-                -F draft=false -F make_latest=true > /dev/null
-            fi
-            echo "✅ ${RELEASE_REPO} Release ${TAG} 已转正并标为 latest"
-          else
-            echo "::error::未能定位/创建 ${RELEASE_REPO} 的 Release ${TAG}"
-            exit 1
-          fi
+          # 收尾自检：最终必须真的是 published，否则让这次 CI 红
+          FINAL=$(state)
+          echo "最终状态 (id draft): ${FINAL}"
+          case "$FINAL" in
+            *" true") echo "::error::${RELEASE_REPO} 的 Release $TAG 仍是草稿"; exit 1 ;;
+          esac
+          echo "✅ ${RELEASE_REPO} Release ${TAG} 已发布并标为 latest"
