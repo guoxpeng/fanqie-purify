@@ -221,12 +221,14 @@ jobs:
             # tag 触发时 tag 一定存在（--verify-tag）；main 触发时由 gh 建 tag（--target main）。
             # tag 恰好已存在但还没有 Release 的情况，--target 可能报错，退回 --verify-tag 重试。
             if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-              gh release create "$TAG" "$APK" "$APK.sha256" --title "$VN" --verify-tag "${NOTES_ARGS[@]}"
+              gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --verify-tag "${NOTES_ARGS[@]}"
             else
-              gh release create "$TAG" "$APK" "$APK.sha256" --title "$VN" --target main "${NOTES_ARGS[@]}" \
-                || gh release create "$TAG" "$APK" "$APK.sha256" --title "$VN" --verify-tag "${NOTES_ARGS[@]}"
+              gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --target main "${NOTES_ARGS[@]}" \
+                || gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --verify-tag "${NOTES_ARGS[@]}"
             fi
           fi
+          # 兜底：确保是「已发布 + 最新」，不会被留在草稿态
+          gh release edit "$TAG" --draft=false --latest || true
 
       - name: 同步模块发布仓库（Vector / LSPosed）
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
@@ -268,12 +270,19 @@ jobs:
           sha256sum "$ASSET" > "$ASSET.sha256"
           if gh release view "$TAG" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
             gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --clobber
+            if [ -f "RELEASE_NOTES_v${VER}.md" ]; then
+              gh release edit "$TAG" --repo "$RELEASE_REPO" --title "v${VER}" \
+                --notes-file "RELEASE_NOTES_v${VER}.md" || true
+            fi
           elif [ -f "RELEASE_NOTES_v${VER}.md" ]; then
-            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --target main \
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --target main \
               --notes-file "RELEASE_NOTES_v${VER}.md" \
-              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --verify-tag \
+              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --verify-tag \
                    --notes-file "RELEASE_NOTES_v${VER}.md"
           else
-            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --target main --generate-notes \
-              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "$VER" --verify-tag --generate-notes
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --target main --generate-notes \
+              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --verify-tag --generate-notes
           fi
+          # 兜底：gh 在「tag 需要现场创建」时偶尔会把 Release 建在草稿态（实测 v1.9.30 就是），
+          # 草稿既不会被当成 latest、也不会出现在 Releases 列表里 → 强制转正 + 标最新。
+          gh release edit "$TAG" --repo "$RELEASE_REPO" --draft=false --latest || true
