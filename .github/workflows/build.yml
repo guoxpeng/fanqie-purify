@@ -210,25 +210,27 @@ jobs:
           VN="${{ steps.ver.outputs.versionName }}"
           NOTES="RELEASE_NOTES_v${VN}.md"
           if [ -f "$NOTES" ]; then NOTES_ARGS=(--notes-file "$NOTES"); else NOTES_ARGS=(--generate-notes); fi
-          if gh release view "$TAG" > /dev/null 2>&1; then
+          # 用 REST 判存在：gh release view 看不到草稿，会把已有的草稿当成不存在再建一个
+          REPO_API="repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"
+          if gh api "$REPO_API" > /dev/null 2>&1; then
             echo "Release $TAG 已存在 → 同步说明 + 覆盖资产"
             # 说明也要跟着源码走：以前只 --clobber 资产，正文永远停在第一次创建时的样子
             if [ -f "$NOTES" ]; then
-              gh release edit "$TAG" --title "v${VN}" --notes-file "$NOTES"
+              gh api -X PATCH "$REPO_API" -f name="v${VN}" -f body="$(cat "$NOTES")" > /dev/null || true
             fi
             gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
           else
-            # tag 触发时 tag 一定存在（--verify-tag）；main 触发时由 gh 建 tag（--target main）。
-            # tag 恰好已存在但还没有 Release 的情况，--target 可能报错，退回 --verify-tag 重试。
-            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # tag 已存在就用 --verify-tag（--target 在 tag 已存在时会把 Release 建成草稿）；
+            # tag 还不存在（main 推送发版）才用 --target main 让 gh 现场建 tag。
+            if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" > /dev/null 2>&1 \
+               || [[ "$GITHUB_REF" == refs/tags/* ]]; then
               gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --verify-tag "${NOTES_ARGS[@]}"
             else
-              gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --target main "${NOTES_ARGS[@]}" \
-                || gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --verify-tag "${NOTES_ARGS[@]}"
+              gh release create "$TAG" "$APK" "$APK.sha256" --title "v${VN}" --target main "${NOTES_ARGS[@]}"
             fi
           fi
           # 兜底：确保是「已发布 + 最新」，不会被留在草稿态
-          gh release edit "$TAG" --draft=false --latest || true
+          gh api -X PATCH "$REPO_API" -F draft=false -F make_latest=true > /dev/null || true
 
       - name: 同步模块发布仓库（Vector / LSPosed）
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
@@ -265,24 +267,33 @@ jobs:
           cd ..
 
           # 发布仓库的 Release：资产名沿用历史约定 Fanqie-Purify_vX.Y.Z.apk，附带同名 .sha256
+          #
+          # ⚠️ 这段为什么不用 `gh release create --target main`：
+          #    tag 已存在时 gh 会先把 Release 建成 **草稿**（tag_name 变成 untagged-xxxx），
+          #    而 `gh release view` 默认看不到草稿 → 下一次运行又以为不存在、再建一个草稿。
+          #    实测 v1.9.30 在发布仓库连出两个草稿，/releases/latest 一直停在 1.9.29。
+          #    改为：① 用 REST 判存在（草稿也能查到）② 建之前先把 tag 推上去 ③ 建完强制转正 + 标最新。
           cp "$APK" "Fanqie-Purify_v${VER}.apk"
           ASSET="Fanqie-Purify_v${VER}.apk"
           sha256sum "$ASSET" > "$ASSET.sha256"
-          if gh release view "$TAG" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
-            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --clobber
-            if [ -f "RELEASE_NOTES_v${VER}.md" ]; then
-              gh release edit "$TAG" --repo "$RELEASE_REPO" --title "v${VER}" \
-                --notes-file "RELEASE_NOTES_v${VER}.md" || true
+          REL_API="repos/${RELEASE_REPO}/releases/tags/${TAG}"
+          NOTES_FILE="RELEASE_NOTES_v${VER}.md"
+          if gh api "$REL_API" > /dev/null 2>&1; then
+            echo "Release $TAG 已存在（含草稿）→ 同步说明 + 覆盖资产"
+            if [ -f "$NOTES_FILE" ]; then
+              gh api -X PATCH "$REL_API" -f name="v${VER}" -f body="$(cat "$NOTES_FILE")" > /dev/null || true
             fi
-          elif [ -f "RELEASE_NOTES_v${VER}.md" ]; then
-            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --target main \
-              --notes-file "RELEASE_NOTES_v${VER}.md" \
-              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --verify-tag \
-                   --notes-file "RELEASE_NOTES_v${VER}.md"
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --clobber
           else
-            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --target main --generate-notes \
-              || gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" --verify-tag --generate-notes
+            # 先把 tag 推到发布仓库，再用 --verify-tag 建 Release（避免草稿化）
+            git -C rel push origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
+            if [ -f "$NOTES_FILE" ]; then
+              gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" \
+                --verify-tag --notes-file "$NOTES_FILE"
+            else
+              gh release create "$TAG" "$ASSET" "$ASSET.sha256" --repo "$RELEASE_REPO" --title "v${VER}" \
+                --verify-tag --generate-notes
+            fi
           fi
-          # 兜底：gh 在「tag 需要现场创建」时偶尔会把 Release 建在草稿态（实测 v1.9.30 就是），
-          # 草稿既不会被当成 latest、也不会出现在 Releases 列表里 → 强制转正 + 标最新。
-          gh release edit "$TAG" --repo "$RELEASE_REPO" --draft=false --latest || true
+          # 兜底：强制转正 + 标为 latest（草稿既不会出现在 Releases 列表，也不会被 /releases/latest 选中）
+          gh api -X PATCH "$REL_API" -F draft=false -F make_latest=true > /dev/null || true
