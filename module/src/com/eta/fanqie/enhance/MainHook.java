@@ -13,8 +13,12 @@ import android.widget.TextView;
 
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -23,6 +27,19 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
+ * 番茄畅听增强模块 v1.9.30（适配 6.7.6.32 / versionCode 676）
+ * v1.9.30 适配新版：
+ *   - 阅读页广告入口行工厂混淆名又变了：f32.q → x32.q（classes15.dex）。
+ *     反汇编确认 a/b/c 三个方法的返回类型没变（AddShortcutLine / ButtonLine /
+ *     BuyVipEntranceLine），调用方由 z33.d.a 变成 u83.d.a，三处调用点仍然紧跟
+ *     `move-result-object` + `if-nez`，所以「返回 null」照旧安全。
+ *     同时把这一处改成**版本无关**实现：候选名列表 + 「有方法返回
+ *     com.dragon.read.ad.*Line」的结构校验 + 候选全落空时后台扫描 dex 兜底，
+ *     下次再改混淆名不必再动代码。
+ *   - TTS 静音 hook：speak(CharSequence,int,HashMap) 在新系统已被移除，
+ *     旧代码把它和 Bundle 版塞在同一个 try 里，导致 NoSuchMethodError 打断整个
+ *     挂载流程（日志长期显示「TTS 静音挂载失败」，其实 Bundle 版本来能挂上）。
+ *     改为逐签名独立 try。
  * 番茄畅听增强模块 v1.9.23（适配 6.7.2.32 / versionCode 672）
  * v1.9.23 新增：屏蔽「XX金币已到账…」语音播报广告 —— 逆向 classes13.dex 定位到字节
  *   Polaris（增长/激励体系）语音播报子系统，在播放入口源码级短路：
@@ -289,6 +306,18 @@ public class MainHook implements IXposedHookLoadPackage {
     private final Set<String> loggedAdEntryChain = new HashSet<>();
     /** v1.9.18 阅读页广告入口行工厂是否已挂载 */
     private boolean readerAdLineHooked = false;
+    /**
+     * v1.9.30：阅读页广告入口行工厂的**候选混淆类名**（新版本在前）。
+     * 这类混淆名每版都换（6.7.2.32 是 f32.q，6.7.6.32 变成 x32.q），
+     * 所以不再写死一个名字，而是按顺序试 + 用「方法返回 com.dragon.read.ad.*Line」
+     * 做结构校验，命中不了再走后台 dex 扫描（scanReaderAdLineFactoryAsync）。
+     */
+    private static final String[] READER_AD_LINE_FACTORY_CANDIDATES = {
+            "x32.q",   // 6.7.6.32 (676) —— 已反汇编确认：a/b/c -> AddShortcutLine/ButtonLine/BuyVipEntranceLine
+            "f32.q",   // 6.7.2.32 (672) 及更早
+    };
+    /** v1.9.30：候选类全部落空后，是否已经启动过后台扫描（只扫一次） */
+    private final AtomicBoolean readerAdLineScanStarted = new AtomicBoolean(false);
     /** v1.9.19 首页 VIP 促销全屏弹层拦截是否已挂载 */
     private boolean vipPromoHooked = false;
     /** v1.9.22 悬浮窗（WindowManagerGlobal.addView）促销文案兜底是否已挂载 */
@@ -2812,13 +2841,51 @@ public class MainHook implements IXposedHookLoadPackage {
     private void hookReaderAdLineFactory() {
         if (readerAdLineHooked) return;
         Class<?> q = null;
-        try {
-            q = XposedHelpers.findClassIfExists("f32.q", appCl);
-        } catch (Throwable ignored) {}
+        String hit = null;
+        for (String cn : READER_AD_LINE_FACTORY_CANDIDATES) {
+            Class<?> c = null;
+            try {
+                c = XposedHelpers.findClassIfExists(cn, appCl);
+            } catch (Throwable ignored) {}
+            // 结构校验：混淆名可能被复用到别的类上，必须确认它真的是「广告行工厂」
+            if (c != null && isReaderAdLineFactory(c)) {
+                q = c;
+                hit = cn;
+                break;
+            }
+        }
         if (q == null) {
-            XposedBridge.log("[" + TAG + "] 阅读页广告行工厂 f32.q 未找到，稍后重试");
+            // 候选全落空：换版本后混淆名又变了，转后台按「返回类型」全量扫描一次
+            if (readerAdLineScanStarted.compareAndSet(false, true)) {
+                XposedBridge.log("[" + TAG + "] 阅读页广告行工厂候选类全部落空，启动后台 dex 扫描");
+                scanReaderAdLineFactoryAsync();
+            } else {
+                XposedBridge.log("[" + TAG + "] 阅读页广告行工厂仍未找到（后台扫描进行中/已完成）");
+            }
             return;
         }
+        hookReaderAdLineFactoryClass(q, hit);
+    }
+
+    /**
+     * 判断一个类是不是「阅读页广告入口行工厂」：只要它有一个方法返回
+     * {@code com.dragon.read.ad.*Line}（AddShortcutLine / ButtonLine / BuyVipEntranceLine）。
+     * 用返回类型而不是类名/方法名做判据，混淆改名也认得出。
+     */
+    private boolean isReaderAdLineFactory(Class<?> c) {
+        if (c == null) return false;
+        try {
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                String rn = m.getReturnType().getName();
+                if (rn.startsWith("com.dragon.read.ad.") && rn.endsWith("Line")) return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    /** 把 a/b/c 三个工厂方法短路成 null（调用方 u83.d.a 用 if-nez 判空，安全跳过） */
+    private void hookReaderAdLineFactoryClass(final Class<?> q, final String clsName) {
+        if (q == null || readerAdLineHooked) return;
         readerAdLineHooked = true;
         final String[] methods = {"a", "b", "c"};
         for (final String m : methods) {
@@ -2832,7 +2899,7 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (rt == null || !rt.getName().startsWith("com.dragon.read.ad.")) return;
                             param.setResult(null);
                             if (readerAdLineBlocked.add(m + ":" + rt.getSimpleName())) {
-                                XposedBridge.log("[" + TAG + "] 🚫 已从源头屏蔽阅读页广告入口行: f32.q."
+                                XposedBridge.log("[" + TAG + "] 🚫 已从源头屏蔽阅读页广告入口行: " + clsName + "."
                                         + m + "() -> " + rt.getSimpleName());
                             }
                         } catch (Throwable ignored) {}
@@ -2840,7 +2907,72 @@ public class MainHook implements IXposedHookLoadPackage {
                 });
             } catch (Throwable ignored) {}
         }
-        XposedBridge.log("[" + TAG + "] ✅ 阅读页广告入口行工厂拦截已挂载: f32.q.a/b/c");
+        XposedBridge.log("[" + TAG + "] ✅ 阅读页广告入口行工厂拦截已挂载: " + clsName + ".a/b/c");
+    }
+
+    /**
+     * v1.9.30：候选类名全落空时的兜底 —— 枚举 dex 里的类名，筛出「混淆短名」
+     * （形如 {@code x32.q} / {@code z70.a}），逐个用 {@link #isReaderAdLineFactory} 校验。
+     *
+     * <p>为什么不在主线程做：要遍历上万个类名并反射取方法表，主线程会卡；
+     * 所以放到后台线程，命中后回主线程挂 hook（挂 hook 本身很快，但 Xposed 的
+     * hook 表操作放主线程更稳）。只在候选类失败后执行一次。
+     */
+    private void scanReaderAdLineFactoryAsync() {
+        Thread t = new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    List<String> names = dexClassNames();
+                    int tried = 0;
+                    for (final String n : names) {
+                        // 只可能是混淆短名：包名 1~4 字符 + 类名 1~3 字符
+                        if (!n.matches("[a-z0-9]{1,4}\\.[a-z0-9]{1,3}")) continue;
+                        Class<?> c;
+                        try {
+                            c = Class.forName(n, false, appCl);
+                        } catch (Throwable ignored) {
+                            continue;
+                        }
+                        tried++;
+                        if (!isReaderAdLineFactory(c)) continue;
+                        final Class<?> found = c;
+                        XposedBridge.log("[" + TAG + "] 🔍 扫描命中阅读页广告行工厂: " + n
+                                + "（共试 " + tried + " 个混淆类）");
+                        new Handler(Looper.getMainLooper()).post(new Runnable() {
+                            @Override public void run() {
+                                hookReaderAdLineFactoryClass(found, n);
+                            }
+                        });
+                        return;
+                    }
+                    XposedBridge.log("[" + TAG + "] 扫描结束：未找到阅读页广告行工厂（试了 "
+                            + tried + " 个混淆类）");
+                } catch (Throwable t) {
+                    XposedBridge.log("[" + TAG + "] 阅读页广告行工厂扫描异常: " + t);
+                }
+            }
+        }, "FQE-line-factory-scan");
+        t.setPriority(Thread.MIN_PRIORITY);
+        t.start();
+    }
+
+    /** 取出当前 App 所有 dex 里的类名（BaseDexClassLoader.pathList.dexElements[].dexFile） */
+    private List<String> dexClassNames() {
+        List<String> out = new ArrayList<>();
+        try {
+            Object pathList = XposedHelpers.getObjectField(appCl, "pathList");
+            Object[] elements = (Object[]) XposedHelpers.getObjectField(pathList, "dexElements");
+            for (Object el : elements) {
+                Object df = null;
+                try { df = XposedHelpers.getObjectField(el, "dexFile"); } catch (Throwable ignored) {}
+                if (!(df instanceof dalvik.system.DexFile)) continue;
+                Enumeration<String> en = ((dalvik.system.DexFile) df).entries();
+                while (en.hasMoreElements()) out.add(en.nextElement());
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] 枚举 dex 类名失败: " + t);
+        }
+        return out;
     }
 
     /**
@@ -3891,27 +4023,40 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedBridge.log("[" + TAG + "] 语音广告拦截失败(" + cn + "): " + t);
             }
         }
+        // v1.9.30：原来两个签名塞在同一个 try 里，第二个 speak(CharSequence,int,HashMap)
+        // 在新系统上已被移除（Android 14+ 只剩 Bundle 版），findAndHookMethod 抛
+        // NoSuchMethodError 会把整个 try 打断 —— 连第一个（真正生效的 Bundle 版）的
+        // 「✅ 已静音」日志都打不出来，日志里一直是「TTS 静音挂载失败」。
+        // 改成逐个签名独立 try，命中几个算几个。
+        XC_MethodHook ttsHook = new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    CharSequence cs = (param.args.length > 0 && param.args[0] instanceof CharSequence)
+                            ? (CharSequence) param.args[0] : null;
+                    if (cs != null && cs.length() > 0) {
+                        XposedBridge.log("[" + TAG + "] 🔇 拦截 TTS 播报: " + cs);
+                    }
+                    param.setResult(0);
+                } catch (Throwable ignored) {}
+            }
+        };
+        boolean ttsAny = false;
         try {
-            XC_MethodHook ttsHook = new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        CharSequence cs = (param.args.length > 0 && param.args[0] instanceof CharSequence)
-                                ? (CharSequence) param.args[0] : null;
-                        if (cs != null && cs.length() > 0) {
-                            XposedBridge.log("[" + TAG + "] 🔇 拦截 TTS 播报: " + cs);
-                        }
-                        param.setResult(0);
-                    } catch (Throwable ignored) {}
-                }
-            };
             XposedHelpers.findAndHookMethod("android.speech.tts.TextToSpeech", appCl, "speak",
                     CharSequence.class, int.class, android.os.Bundle.class, String.class, ttsHook);
+            ttsAny = true;
+        } catch (Throwable ignored) {}
+        try {
             XposedHelpers.findAndHookMethod("android.speech.tts.TextToSpeech", appCl, "speak",
                     CharSequence.class, int.class, java.util.HashMap.class, ttsHook);
-            XposedBridge.log("[" + TAG + "] ✅ TTS 播报已静音");
-        } catch (Throwable t) {
-            XposedBridge.log("[" + TAG + "] TTS 静音挂载失败: " + t);
-        }
+            ttsAny = true;
+        } catch (Throwable ignored) {}
+        try {
+            XposedHelpers.findAndHookMethod("android.speech.tts.TextToSpeech", appCl, "speak",
+                    String.class, int.class, java.util.HashMap.class, ttsHook);
+            ttsAny = true;
+        } catch (Throwable ignored) {}
+        XposedBridge.log("[" + TAG + "] " + (ttsAny ? "✅ TTS 播报已静音" : "TTS 静音未挂上（签名都不匹配）"));
         // v1.9.25：金币播报/语音广告是**服务端下发 .aac**（novel-tts/warningtone_*.aac），
         // 在 Cronet 请求层直接掐掉下载，比在播放器层拦更彻底。
         try {

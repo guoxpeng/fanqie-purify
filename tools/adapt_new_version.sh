@@ -171,7 +171,7 @@ STABLE_TARGETS=(
   "com.bytedance.tomato.onestop.readerad.ui.ReadFlowOneStopAtAdView"
 )
 OBF_TARGETS=(
-  "f32.q:i23.d0"                     # 阅读页广告入口行工厂 : VIP 促销弹层
+  "x32.q:i23.d0"                     # 阅读页广告入口行工厂 : VIP 促销弹层
 )
 
 DEXDIR=.buildtmp/adapt_dex

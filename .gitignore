@@ -43,6 +43,9 @@ tools/*
 !tools/dexsig.py
 # apkver.py：CI 发布前用它校验「仓库模板 APK」的 versionName/versionCode，必须入库
 !tools/apkver.py
+# dexq.py / check_targets.py：换版本时的通用逆向小工具（不含本机绝对路径），所有机器都能用
+!tools/dexq.py
+!tools/check_targets.py
 
 # ===== 工作记忆（本地） =====
 .workbuddy-ai/

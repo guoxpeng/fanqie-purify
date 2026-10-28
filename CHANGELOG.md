@@ -2,6 +2,45 @@
 
 所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.9.30] - 2026-10-28
+
+### 适配番茄畅听 6.7.6.32（versionCode 676）
+实测设备升级到 6.7.6.32 后，模块其余 40+ 处 hook 全部照常挂载（广告位总闸 / OneStop 阅读页广告 /
+Lynx 广告场景 / silk subwindow / 音乐贴片广告 / 全天畅听特权伪装 / 语音播报屏蔽 …），只有两处需要处理：
+
+- **阅读页广告入口行工厂混淆名又变了：`f32.q` → `x32.q`（classes15.dex）**
+  - 反汇编确认三个工厂方法结构没变：`a→AddShortcutLine` / `b→ButtonLine`（「看小视频免30分钟广告」）/
+    `c→BuyVipEntranceLine`；调用方由 `z33.d.a` 变成 `u83.d.a`，三处调用点仍然紧跟
+    `move-result-object` + `if-nez`，所以「返回 null 让 App 跳过添加该行」照旧安全（实测日志
+    `🚫 已从源头屏蔽阅读页广告入口行: x32.q.b() -> ButtonLine`）。
+  - **顺手把这一处改成版本无关实现**：`READER_AD_LINE_FACTORY_CANDIDATES` 候选名列表
+    （新版在前）+ `isReaderAdLineFactory()` 结构校验（有方法返回 `com.dragon.read.ad.*Line` 才算命中）
+    + 候选全落空时 `scanReaderAdLineFactoryAsync()` 后台枚举 dex 类名兜底。
+    以后再改混淆名不用动代码，直接看日志里命中的类名即可。
+- **TTS 静音 hook 一直显示「挂载失败」**
+  - 原因不是新版 App，而是系统侧：`speak(CharSequence,int,HashMap)` 在新 Android 上已被移除，
+    而旧代码把它和真正生效的 `speak(CharSequence,int,Bundle,String)` 塞在同一个 try 里，
+    `NoSuchMethodError` 直接打断整个挂载流程（连「✅ 已静音」都打不出来）。
+  - 改为逐签名独立 try，并补上 `speak(String,int,HashMap)` 这个老签名。
+
+### 工具
+- 新增 `tools/dexq.py`：不依赖 jadx/baksmali 的 dex 查询器，支持
+  `--returns`（按返回类型找工厂方法）/ `--class`（方法表）/ `--refs` / `--str` / `--find-class`，
+  这次定位 `x32.q` 就是靠 `--returns Lcom/dragon/read/ad/AddShortcutLine;` 一条命令查出来的。
+- 新增 `tools/check_targets.py`：把 MainHook.java 里出现的类名候选一次性拿去新 dex 里核对存在性，
+  换版本先跑这个，能立刻看到哪些 hook 目标消失了。
+
+## [v1.9.27] - 2026-10-22
+
+### 修复（章节结束仍有「畅听时长不足」提示语音）
+- **定位**：classes16.dex 的 `vc2.e` / `wc2.e`（实现提示 provider 接口）在 `a()` 里拼出
+  `https://lf6-file.novelfmstatic.com/obj/novel-common/warningtone_pre_novelfm_listen_time_not_enough_*.aac`
+  等一整套提示音 URL，日志 tag `AdUnlockTimeTipsIntercept`，然后 `new i.c(url, …)` 交给播放器。
+  v1.9.26 的播放器 hook 没命中，是因为这条链路走的是 TTM 原生播放器（Java 层没有可 hook 的 setDataSource）。
+- **处理**：新增 `hookUnlockTimeTipsProvider()`，把这两个 `a()` 直接返回 null —— URL 根本不生成，
+  播放器拿不到地址。方法标了 @Nullable，调用方按空值处理，不会崩。
+- 保留 v1.9.24~26 的 AudioAdManager / TTS / 播放器 URL 三层兜底。
+
 ## [v1.9.26] - 2026-10-22
 
 ### 修复（v1.9.25 的 Cronet 拦截未生效：章节结束仍有「领取金币」语音）
