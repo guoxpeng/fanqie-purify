@@ -7,6 +7,7 @@
 
 > **当前版本：v1.9.52** ｜ **适配目标应用：番茄畅听 `6.8.0.32`（versionCode `680`）实测通过**
 > 框架要求：Root + Vector 或 LSPosed（xposedminversion 82，Android 8.0+）
+> ⬇️ **下载**：[主仓 Release v1.9.52](https://github.com/guoxpeng/fanqie-purify/releases/latest) ｜ 校验 `sha256 cd858560493cdbc4a8e8ac3abf12abb8a39b20a68e2349c3fd3edf44a4982735`
 
 > ⚠️ **已知现象（不是模块的 BUG）**：番茄畅听播放时，Motorola 机型顶部会出现一条**纯黑胶囊**。
 > 那是系统 UI 的「媒体灵动岛」折叠态，内容槽只接受特权应用写入，第三方 App 填不进去。
