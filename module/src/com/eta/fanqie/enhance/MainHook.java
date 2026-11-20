@@ -2,9 +2,11 @@ package com.eta.fanqie.enhance;
 
 import android.app.Activity;
 import android.app.Dialog;
+import android.app.Notification;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.media.session.MediaSession;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -16,6 +18,7 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -151,6 +154,12 @@ public class MainHook implements IXposedHookLoadPackage {
             "com.dragon.read.coin.",
             "com.dragon.read.welfare.",
             "com.dragon.read.wallet.",
+            // v1.9.38：6.8.0.32 赚金币浮层/页面（静态反查 classes*.dex 命中）
+            //   PeriodCoinNotificationActivity 在 com.dragon.read.polaris 包下（不在旧 BLOCKED 内）
+            "com.dragon.read.polaris.PeriodCoinNotificationActivity",
+            //   Polaris 任务浮层（bytedance.polaris.impl.view.PolarisTaskFragment 二兄弟，
+            //   从下往上滑出、占满屏的赚金币任务页；不动时长/播放器，只拦页面）— 见 hookCoinSheetPages
+            //   故意不写前缀到 BLOCKED（会误伤 Polaris 其它正常页），改在 isCoinTaskPage 精确判定。
             // 全部功能页（含商城/借钱/公益等入口）
             "com.dragon.read.pages.mine.AllFunctionActivity",
             // 邀请/红包
@@ -167,6 +176,40 @@ public class MainHook implements IXposedHookLoadPackage {
     private final StringBuilder adHookReport = new StringBuilder();
     private long lastReportLog = 0;
     private final Set<String> clickedSkip = new HashSet<>();
+    // v1.9.38：番茄原生 MediaSession token（用于给播控栏通知注入 MediaStyle → 系统媒体快捷卡片）
+    private volatile Object mediaSessionToken = null;
+    private boolean mediaCardHookDone = false;
+    // ★★★ 结论定稿（2026-11-20 实测 A/B）：绝不要打开 MediaStyle 注入。
+    // 顶部黑条 = Motorola SystemUI 的 LiveContentPeek 灵动岛折叠态，owner=uid10305/com.android.systemui，
+    //   窗口 frame (0,18)(1296x124)，像素 y40~120 纯黑；它读取「番茄前台服务通知」渲染。
+    // 决定性反证：当前 v1.9.39 注入已关（通知为原生 contentView=0x7f04070c、无 android.mediaSession
+    //   extra），黑条**依旧出现** → 黑条成因与模块注入无关，是 ROM 对番茄通知(title/icon/color 全 null)
+    //   的默认折叠渲染。点击黑条展开态（tapbar.png）封面/书名/进度齐全，功能完全正常。
+    // v1.9.38 曾误判并注入空壳 MediaStyle → 制造出一个额外黑条；v1.9.39 关闭后恢复原生。
+    // v1.9.40 一度尝试「安全克隆再注入」，经实测证伪并撤销 —— 保持 false，永不再开。
+    // 系统媒体键(蓝牙/线控)本就能控番茄(PLAYING↔PAUSED 实测)，无需注入。
+    private static final boolean ENABLE_MEDIA_CARD_INJECT = false;
+    // v1.9.42：灵动岛 opt-out 已移除（干净 A/B 证明黑条与模块无关，见 handleLoadPackage 注释）。
+    // v1.9.43：给番茄播控通知补 Motorola 灵动岛 Peek 内容，消除「空壳黑条」。
+    //   反编译依据（SystemUI 6.8 实测 2026-11-20）：
+    //   LiveContentUtils.getCustomPeekData(Notification) 读 extras：
+    //     motorola.notification.liveContentNotification=true  → isMotoLiveContent()=true
+    //     motorola.notification.flags bit0 必须为 0            → 否则 isMotoLiveContentDisabled()=true
+    //     motorola.livecontent.peekTitle / peekContent / peekIcon → 组装 PeekData
+    //   PeekData.isValid = (icon!=null || title!=null || text!=null)，任一非空即有效。
+    //   只改番茄自身通知，不注入 SystemUI、不影响其他 app。
+    //   v1.9.44 修正：番茄播控通知走 Service.startForeground（flags=FOREGROUND_SERVICE），
+    //   不经过 NotificationManager.notify —— 必须挂 startForeground 才拦得到（实测 2026-11-20）。
+    private volatile Object liveContentMetadata = null;
+    private volatile Object liveContentSessionToken = null;   // 番茄 MediaSession 的 token（补进通知用）
+    private boolean liveContentPeekDone = false;
+    private int liveContentDiagCount = 0;              // 播控渠道诊断日志配额
+    private int liveContentDiagOther = 0;              // 其它渠道诊断日志配额
+    private int remoteViewsTried = 0;                  // RemoteViews 兜底尝试次数上限
+    private int liveContentIdLog = 0;                  // 取证日志配额（对象身份）
+    private boolean sysuiPeekBlockedLogged = false;     // SystemUI 侧「已拦截」日志只打一次
+    private int sysuiTraceCount = 0;                    // 轨迹日志配额
+    private boolean sysuiSessionErrLogged = false;      // 取活动媒体会话失败日志只打一次
     private long lastSkipClick = 0;
     // 性能缓存
     private boolean vipPatched = false;              // patchVip 成功后不再重复反射
@@ -203,20 +246,41 @@ public class MainHook implements IXposedHookLoadPackage {
      * 彻底消除「首帧闪现」问题（事后 setVisibility/GONE 仍会先渲染一帧）。
      * 这些 ID 从 aapt2 dump resources 获得，只对该版本有效；换版本后需重新提取。
      */
-    private static final Set<Integer> PRE_HIDE_RES_IDS = new HashSet<>(java.util.Arrays.asList(
-            0x7f102989, // id/gxi  主页顶部"全天畅听"入口
-            0x7f100e89, // id/bwf  阅读页全天免费畅听中容器
-            0x7f1028fe, // id/gtr  阅读页全天免费畅听文本
-            0x7f10062d, // id/abz  阅读页300金币 ImageView
-            0x7f10062b, // id/abx  阅读页300金币容器
-            0x7f1004c5, // id/a3c  听歌页横幅广告
-            0x7f1022e9, // id/fp_  听歌页卡片广告
-            // v1.9.21 新增：「我的」页四块（按 6.7.2.32 的实机 View 树重新定位）
-            0x7f100df5, // id/bsf  我的页 VIP 促销卡片
-            0x7f101af2, // id/e87  我的资产 + 邀请好友/好友管理板块
-            0x7f101a72, // id/e4q  我的页快捷入口栏（我的消息/优惠券/购物车/商城/游戏中心）
-            0x7f10116c  // id/cfe  上者的外包装容器（只藏 e4q 会留下 1008x238 的空白）
-    ));
+    /**
+     * v1.9.31（适配 6.7.6.32 / 676）：672 时代硬编码的 0x7f10xxxx 资源整数在新版里
+     * 已经整体重排，继续用会**静默失效**（表现为零散「小广告」漏网，且不报错）。
+     * 改为运行时按资源**名字**解析，见 refreshPreHideIds()。
+     */
+    private static final Set<Integer> PRE_HIDE_RES_IDS = new HashSet<>();
+    private static volatile boolean preHideResolved = false;
+    private static final String[] PRE_HIDE_RES_NAMES = {
+            // 672 时代沿用（若 676 仍存在则命中）
+            "gxi", "bwf", "gtr", "abz", "abx", "a3c", "fp_",
+            "bsf", "e87", "e4q", "cfe",
+            // 676 新增的小广告 / 运营入口（从本机 676 包与运行时广告位日志收集）
+            "audio_info_flow_ad", "audio_patch_chapter_ad", "audio_patch_pause_ad",
+            "audio_patch_wakeup_ad", "music_feed_ad", "music_immersive_ad",
+            "growth_coins", "novelfm_cash", "open_red_package",
+            "pre_all_day_ad_free", "template_1_default"
+    };
+
+    /** 第一次 addView 时按名解析资源 id，避免版本间硬编码漂移。 */
+    private static void refreshPreHideIds(android.content.Context ctx) {
+        if (preHideResolved || ctx == null) return;
+        synchronized (PRE_HIDE_RES_IDS) {
+            if (preHideResolved) return;
+            int hit = 0;
+            try {
+                android.content.res.Resources r = ctx.getResources();
+                for (String n : PRE_HIDE_RES_NAMES) {
+                    int id = r.getIdentifier(n, "id", "com.xs.fm");
+                    if (id > 0) { PRE_HIDE_RES_IDS.add(id); hit++; }
+                }
+            } catch (Throwable ignored) {}
+            preHideResolved = true;
+            XposedBridge.log("[FanqieEnhance] 预隐藏资源ID按名解析: " + hit + "/" + PRE_HIDE_RES_NAMES.length);
+        }
+    }
 
     /**
      * v1.9.11 广告位总闸所在类。
@@ -255,7 +319,15 @@ public class MainHook implements IXposedHookLoadPackage {
             // ⚠️ "book_mall_feed_ad" 已移除：该广告位与听书页正常 UI（tab/三个点菜单）绑定，
             //    拦截会导致正常功能消失。商店图标改用 View 层定位隐藏。
             "mini_game_config",   // 小游戏广告配置
-            "free_ad_enter"       // 免费广告入口（看广告解锁等）
+            "free_ad_enter",      // 免费广告入口（看广告解锁等）
+            // v1.9.31：6.7.6.32 / 676 新增的被动展示位（只拦被动，金币/红包/现金等
+            // 用户主动入口不在此列，交给 PRE_HIDE_RES_NAMES 的 View 层隐藏处理）
+            "audio_info_flow_ad",       // 听书信息流（676 改名）
+            "audio_patch_chapter_ad",   // 章节间贴片
+            "audio_patch_pause_ad",     // 暂停贴片
+            "audio_patch_wakeup_ad",    // 唤醒贴片
+            "music_feed_ad",            // 听歌信息流
+            "music_immersive_ad"        // 听歌沉浸流
     ));
 
     /**
@@ -318,6 +390,8 @@ public class MainHook implements IXposedHookLoadPackage {
     };
     /** v1.9.30：候选类全部落空后，是否已经启动过后台扫描（只扫一次） */
     private final AtomicBoolean readerAdLineScanStarted = new AtomicBoolean(false);
+    /** v1.9.33：购物入口球只打一次日志，避免每轮扫描刷屏 */
+    private final AtomicBoolean loggedShopBall = new AtomicBoolean(false);
     /** v1.9.19 首页 VIP 促销全屏弹层拦截是否已挂载 */
     private boolean vipPromoHooked = false;
     /** v1.9.22 悬浮窗（WindowManagerGlobal.addView）促销文案兜底是否已挂载 */
@@ -339,10 +413,21 @@ public class MainHook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+        // ★ v1.9.49：新增 SystemUI 侧作用域。
+        //   为什么必须进系统进程：黑条 = Motorola 媒体灵动岛浮层（LiveContentPeek）。
+        //   它的内容槽只认通知里的 motorola.livecontent.* extras，而摩托罗拉框架在 system_server
+        //   侧会把这些键从第三方应用的通知里**整体丢弃**（实测：同一份通知里 android.title 保住、
+        //   motorola.* 全消失 / motorola.notification.flags 反而保留）。所以 app 侧无论怎么写都填不进去。
+        //   唯一精准的办法：在 SystemUI 里拦住「番茄」那一次浮层挂载（requestAttachMedia），
+        //   其他 App 的媒体胶囊完全不受影响。
+        if ("com.android.systemui".equals(lpparam.packageName)) {
+            hookSystemUiLiveContentForFanqie(lpparam.classLoader);
+            return;
+        }
         if (!"com.xs.fm".equals(lpparam.packageName)) {
             return;
         }
-        XposedBridge.log("[" + TAG + "] v1.9.24 加载: process=" + lpparam.processName);
+        XposedBridge.log("[" + TAG + "] v1.9.52-680 加载: process=" + lpparam.processName);
         this.appCl = lpparam.classLoader;
         hookActivityBlocker();
         hookDialogBlocker();
@@ -367,6 +452,12 @@ public class MainHook implements IXposedHookLoadPackage {
         hookAudioAdManager();            // v1.9.24 新增：章节结束语音广告（AudioAdManager/TTS）
         hookPlayerUrlBlocker();          // v1.9.26 新增：播放器数据源兜底（warningtone/novel-tts 音频）
         hookListenTimeGate();            // v1.9.29 新增：畅听时长/全天畅听特权伪装（点听书不再被「时长已用完」拦停）
+        hookCoinSheetPages();            // v1.9.38 新增：拦截 680 赚金币浮层（从下往上占满屏）
+        // v1.9.42：MediaStyle 注入 + 灵动岛 opt-out 全部移除。
+        // 干净 A/B 实测(2026-11-20)：模块日志 0 条(彻底无 hook)时黑条像素 1310，与装模块完全相同
+        // → 黑条是 Motorola SystemUI 灵动岛的预留黑底，与模块代码无关。模块恢复为纯广告拦截，不再碰通知。
+        // v1.9.43：真正根因已定位（Peek 内容槽空 + 容器深色默认背景），改为给番茄通知补 live content 字段。
+        hookLiveContentPeekData();
         scheduleAdSignalRetry();
         scheduleMineTreeDump();          // v1.9.21 诊断：抓「我的」页视图树
     }
@@ -448,7 +539,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /** 广告入口文本关键词（精确匹配，防误伤正文） */
     private boolean isAdEntryText(String t) {
-        if (t == null || t.length() > 14) return false;
+        if (t == null) return false;
+        // v1.9.38：金币挽留长文案放行到 22 字（"退出后就无法继续听书赚金币了哦"=15 字，
+        // 旧版 length()>14 直接漏掉）。只给含"金币/听书/退出"的挽留句放宽，其余仍限 14 字防误伤正文。
+        boolean coinRetain = t.length() <= 22 && t.contains("金币")
+                && (t.contains("退出") || t.contains("听书") || t.contains("继续"));
+        if (!coinRetain && t.length() > 14) return false;
+        if (coinRetain && (t.contains("退出后就无法继续") || t.contains("听书赚金币"))) return true;
         // 畅听/免广告类
         if (t.contains("全天免费畅听") || t.contains("全天畅听") || t.contains("免广告")
                 || t.contains("看小视频") || t.contains("看视频免") || t.contains("免费畅听")
@@ -525,6 +622,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     for (int i = 0; i < 8; i++) {
                         View p = (View) cur.getParent();
                         if (p == null) break;
+                        // v1.9.32：爬升到听书页「智能朗读|真人讲书」顶栏即停，
+                        // 否则会把整条顶栏当广告卡片 GONE，切换按钮连带消失。
+                        if (containsVoiceSwitchText(p, 2)) break;
                         int pw = p.getWidth(), ph = p.getHeight();
                         try { p.getLocationOnScreen(ploc); } catch (Throwable ignored2) {}
                         // 页面级容器保护：宽>=90%屏宽 且 高>=40%屏高 → 不藏，停
@@ -1857,6 +1957,37 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void scanAll(View v, int depth, int[] cnt, Activity act) {
         if (v == null || depth > 25) return;
+        // v1.9.36：听书页顶栏右侧「购物/金币球」——按 View 自身特征识别，不依赖容器资源名。
+        // 1.9.35 诊断证据：按 getIdentifier("aco") 命中的容器 bar=117x143 childCount=6，
+        //   根本不是目标的 aco（268x143 / 2 子），按容器 id 定位不可靠，已废弃。
+        // 目标（676 实机控件树）：无 resource-id、可点击的 ImageView，
+        //   bounds=[1208,166][1289,247] = 81x81，位于屏幕右上；
+        //   三点菜单 id/acq、下拉箭头 id/k 都有 id，被 getId()==NO_ID 排除。
+        // ⚠️ 不改 visibility（GONE / INVISIBLE 都会让 App 收起整条顶栏），
+        //    只用 alpha=0 + 不可点击：View 仍为 VISIBLE，App 无感知。
+        // v1.9.37：按「父链内容特征」定位，不依赖几何坐标、容器 id 或顶栏可见性。
+        // 676 控件树：橙球(无 id, clickable ImageView) -> id/aco -> 顶栏 acr，
+        // 而 acr 的另一个直接子 e94 里就是「智能朗读」「真人讲书」两个 TextView。
+        // 三点菜单 id/acq、下拉箭头 id/k 都有 id，被 getId()==NO_ID 排除。
+        if (v instanceof android.widget.ImageView && v.getId() == View.NO_ID
+                && v.isClickable()) {
+            try {
+                View p = v;
+                boolean nearSwitch = false;
+                for (int i = 0; i < 3 && p != null; i++) {
+                    if (containsVoiceSwitchText(p, 2)) { nearSwitch = true; break; }
+                    p = (p.getParent() instanceof View) ? (View) p.getParent() : null;
+                }
+                if (nearSwitch) {
+                    v.setAlpha(0f);
+                    v.setClickable(false);
+                    if (loggedShopBall.compareAndSet(false, true)) {
+                        XposedBridge.log("[" + TAG + "] 购物入口球透明化(父链含切换按钮) "
+                                + v.getWidth() + "x" + v.getHeight());
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
         if (coinEntryId == -1 && act != null) {
             try { coinEntryId = act.getResources().getIdentifier("h80", "id", act.getPackageName()); }
             catch (Throwable t) { coinEntryId = 0; }
@@ -2433,6 +2564,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     try {
                         View child = (View) param.args[0];
                         if (child == null) return;
+                        // v1.9.31：第一次有 View 上下文时按名解析 676 的资源 id（替代硬编码）
+                        refreshPreHideIds(child.getContext());
                         String fullClsName = child.getClass().getName();
                         if (adFullNames.contains(fullClsName)) {
                             child.setVisibility(View.GONE);
@@ -2441,6 +2574,8 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                         // v1.9.11 新增：按已知广告资源 ID 预拦截，消除首帧闪现。
                         // 资源 ID 在 XML inflate 时已通过 setId() 设置，addView 前已可用。
+                        // v1.9.32：顶栏含切换按钮，不参与按 resId 的预隐藏
+                        if (containsVoiceSwitchText(child, 2)) return;
                         int cid = child.getId();
                         if (cid == View.NO_ID) return;
                         Set<Integer> cached = cachedHideIds;
@@ -2976,6 +3111,53 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
+     * v1.9.38「版本自适应」核心：把一批硬编码 hook 目标扩展为"同结构变体"。
+     *
+     * <p>规律实证（对比 671/67132/67232/676/680 五个版本 17 万类名）：番茄这些 hook 目标的
+     * 包路径极其稳定（46/46 关键类跨 5 版零变化），真正会变的是两类尾缀：
+     *   ① KMP 双端路径 v2 → 未来 v3/v4（如 ...unlocktime.kmp.v2.g0）；
+     *   ② R8 单字母混淆尾缀 h → i/j（如 ...entranceview.h、...listen.strategy.h）。
+     * 本方法对 seed 生成"父包相同 + 末段形态相同"的变体，从 dex 实际类名里筛出候选，
+     * 让模块在番茄升级、混淆字母变化、KMP 升版时无需重编译也能命中。</p>
+     *
+     * <p>约束极严，避免误伤：只接受与 seed 同父包、且末段同为"单个小写字母"或"同名"的类；
+     * vN 通配只对 seed 中确实含 {@code .kN.} 形态段的才启用。原 seed 永远保留在结果首位。</p>
+     */
+    private String[] expandVariants(String[] seeds) {
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        for (String s : seeds) out.add(s);
+        try {
+            List<String> all = dexClassNames();
+            for (String seed : seeds) {
+                int lastDot = seed.lastIndexOf('.');
+                if (lastDot <= 0) continue;
+                String parent = seed.substring(0, lastDot + 1);
+                String tail = seed.substring(lastDot + 1);
+                boolean tailSingleLower = tail.length() == 1 && tail.charAt(0) >= 'a' && tail.charAt(0) <= 'z';
+                // 父包 -> 正则：逐段拼，遇到 kN 段(k+数字)用 k\\d+ 通配以适配 KMP 升版
+                StringBuilder prx = new StringBuilder();
+                for (String seg : parent.substring(0, parent.length() - 1).split("\\.")) {
+                    if (prx.length() > 0) prx.append("\\.");
+                    if (seg.matches("k\\d+")) prx.append("k\\d+");
+                    else prx.append(java.util.regex.Pattern.quote(seg));
+                }
+                String tailPat = tailSingleLower ? "[a-z]" : java.util.regex.Pattern.quote(tail);
+                java.util.regex.Pattern pat = java.util.regex.Pattern.compile(prx + "\\." + tailPat);
+                for (String cn : all) {
+                    if (!pat.matcher(cn).matches()) continue;
+                    if (!cn.equals(seed)) out.add(cn);
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] expandVariants 失败(用原seed): " + t);
+        }
+        if (out.size() > seeds.length) {
+            XposedBridge.log("[" + TAG + "] 版本自适应: 目标从 " + seeds.length + " 扩展到 " + out.size() + " 个变体");
+        }
+        return out.toArray(new String[0]);
+    }
+
+    /**
      * v1.9.19 新增：从源头屏蔽首页「VIP 促销全屏弹层」
      * （屏幕上那整屏的「仅限当前设备开通7天会员，限时有效」浮层；整层无 resource-id、
      * 只有 content-desc，是 Lynx 自绘的促销页）。
@@ -3503,7 +3685,629 @@ public class MainHook implements IXposedHookLoadPackage {
         // 广告弹窗通用关键词（限定在 ad 相关包，避免误伤）
         if ((l.contains("ad") || l.contains("advert")) && (l.contains("dialog") || l.contains("pop") || l.contains("unlock"))) return true;
         if (l.contains("luckycat") || l.contains("reward") && l.contains("dialog")) return true;
+        // v1.9.38：6.8.0.32 赚金币任务浮层——这两个前缀用具体包名，不误伤 Polaris 其它正常组件。
+        //   PolarisTaskFragment/2 继承 UploadStayTimeAbsFragment（普通 Fragment，从下滑出占满屏）
+        //   rewardpopup 是宝箱/奖励弹窗体系（TreasureRewardPopup*）
+        if (l.startsWith("com.bytedance.polaris.impl.view.polaristaskfragment")) return true;
+        if (l.startsWith("com.bytedance.polaris.impl.rewardpopup.")) return true;
         return false;
+    }
+
+    /** v1.9.38：精确判定"赚金币任务页/Dialog"——用于 Activity.onResume 与 View 层兜底，
+     *  只认 680 实测存在的类，不碰时长门/播放器 logice。 */
+    private boolean isCoinTaskClass(String n) {
+        if (n == null) return false;
+        String l = n.toLowerCase();
+        if (l.contains("periodcoinnotificationactivity")) return true;
+        if (l.contains("polaristaskfragment")) return true;
+        if (l.contains("treasurerewardpopup") || l.contains("golddoubledialogmanager")) return true;
+        if (l.contains("unlocktimetaskcontainer") || l.contains("unlocktimetaskdialog")) return true;
+        return false;
+    }
+
+    /** v1.9.38：拦截 680"从下往上占满屏的赚金币浮层"。
+     *  ① Dialog.show 层：金币 Dialog/弹窗一 show 就 dismiss（BottomSheet 的窗口由 Dialog 承载）。
+     *  ② DialogFragment.onStart 层：Fragment 形态的金币浮层 dismiss。
+     *  UnlockTimeTaskDialog 虽已被 isAdFragmentClass 覆盖，这里用 isCoinTaskClass 再兜一道，
+     *  幂等无副作用。只拦精确类，不动 hookListenTimeGate 的时长伪装。 */
+    private void hookCoinSheetPages() {
+        try {
+            // ① Dialog.show —— 覆盖所有 BottomSheetDialog（UnlockTimeTaskDialogV2、rewardpopup 等）
+            XposedHelpers.findAndHookMethod(Dialog.class, "show", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Dialog d = (Dialog) param.thisObject;
+                        if (d == null) return;
+                        String name = d.getClass().getName();
+                        if (isCoinTaskClass(name)) {
+                            d.dismiss();
+                            XposedBridge.log("[" + TAG + "] 已拦截赚金币浮层(Dialog.show): " + name);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            // ② DialogFragment.onStart —— Fragment 形态金币浮层
+            Class<?> dfCls = XposedHelpers.findClassIfExists("androidx.fragment.app.DialogFragment", appCl);
+            if (dfCls != null) {
+                XposedHelpers.findAndHookMethod(dfCls, "onStart", new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            String n = param.thisObject.getClass().getName();
+                            if (isCoinTaskClass(n)) {
+                                try { param.thisObject.getClass().getMethod("dismiss").invoke(param.thisObject); } catch (Throwable ignored2) {}
+                                XposedBridge.log("[" + TAG + "] 已拦截赚金币浮层(DialogFragment): " + n);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                });
+            }
+            XposedBridge.log("[" + TAG + "] 赚金币浮层拦截器已启用(v1.9.38)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] 赚金币浮层拦截器失败: " + t);
+        }
+    }
+
+    /**
+     * v1.9.38：让番茄播控栏通知接入 Android 系统媒体快捷卡片。
+     *
+     * 背景（6.8.0.32 实测）：番茄的 MediaSession 是 active 的（media button session = com.xs.fm，
+     * 蓝牙/线控按键已可控），但播控栏通知是自绘 RemoteViews、channel=audio_notify_channel(_new)、
+     * importance=2 且没有 MediaStyle，系统不把它当媒体卡片 → 下拉栏/锁屏没有播放暂停按钮。
+     *
+     * 做法（全 try-catch，绝不影响播放）：
+     *   ① hook android.media.session.MediaSession 构造，保存番茄原生 session，拿它的 Token；
+     *   ② hook NotificationManager.notify，识别番茄播控栏通知后，用原生 Notification.Builder
+     *      重建为 MediaStyle + setMediaSession(token)。按钮/封面由系统依据 PlaybackState.actions 渲染。
+     * 不重试、不改动番茄自身状态机；注入失败就保持原通知不变。
+     */
+    private void hookMediaSessionCard() {
+        // ① 拿原生 MediaSession token
+        try {
+            Class<?> msCls = XposedHelpers.findClass("android.media.session.MediaSession", null);
+            XposedBridge.hookAllConstructors(msCls, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object token = param.thisObject.getClass().getMethod("getSessionToken").invoke(param.thisObject);
+                        if (token != null) {
+                            mediaSessionToken = token;
+                            XposedBridge.log("[" + TAG + "] 捕获 MediaSession token: " + token);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] MediaSession token hook 失败: " + t);
+        }
+        // ② notify 时把播控栏通知转成 MediaStyle
+        try {
+            XposedHelpers.findAndHookMethod(android.app.NotificationManager.class, "notify",
+                    String.class, int.class, Notification.class, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Notification n = (Notification) param.args[2];
+                                Object token = mediaSessionToken;
+                                if (n == null || token == null) return;
+                                String ch = n.getChannelId();
+                                boolean isAudio = "audio_notify_channel".equals(ch)
+                                        || "audio_notify_channel_new".equals(ch);
+                                if (!isAudio) return;
+                                // 已经带 mediaSession 的不重复注入（幂等）
+                                try {
+                                    if (n.extras != null && n.extras.containsKey("android.mediaSession")) return;
+                                } catch (Throwable ignored) {}
+                                android.content.Context ctx = (android.content.Context) Class.forName("android.app.ActivityThread")
+                                        .getMethod("currentApplication").invoke(null);
+                                if (ctx == null) return;
+                                // ★ v1.9.40：以原通知为模板手工全量复制，只追加 MediaStyle；绝不丢 RemoteViews。
+                                // 不用 Builder(Context,Notification) —— 本机 android.jar 无该构造器。
+                                Notification.Builder b = new Notification.Builder(ctx, ch)
+                                        .setSmallIcon(n.icon)
+                                        .setContentIntent(n.contentIntent)
+                                        .setDeleteIntent(n.deleteIntent)
+                                        .setTicker(n.tickerText)
+                                        .setWhen(n.when)
+                                        .setNumber(n.number)
+                                        .setCategory(n.category)
+                                        .setVisibility(n.visibility)
+                                        .setPriority(n.priority)
+                                        .setColor(n.color)
+                                        .setSound(n.sound)
+                                        .setVibrate(n.vibrate)
+                                        .setLights(n.ledARGB, n.ledOnMS, n.ledOffMS)
+                                        .setOngoing((n.flags & Notification.FLAG_ONGOING_EVENT) != 0)
+                                        .setAutoCancel((n.flags & Notification.FLAG_AUTO_CANCEL) != 0)
+                                        .setOnlyAlertOnce((n.flags & Notification.FLAG_ONLY_ALERT_ONCE) != 0)
+                                        .setStyle(new Notification.MediaStyle()
+                                                .setMediaSession((MediaSession.Token) token));
+                                if (n.largeIcon != null) b.setLargeIcon(n.largeIcon);
+                                if (n.contentView != null) b.setCustomContentView(n.contentView);
+                                if (n.bigContentView != null) b.setCustomBigContentView(n.bigContentView);
+                                if (n.headsUpContentView != null) b.setCustomHeadsUpContentView(n.headsUpContentView);
+                                // 原 extras（标题/歌词/业务标记）全量带过去，再让 MediaStyle 写入 mediaSession
+                                if (n.extras != null) b.getExtras().putAll(n.extras);
+                                Notification rebuilt = b.build();
+                                rebuilt.flags = n.flags;   // 还原全部 flag 位，避免 OEM ROM 因 ongoing 丢失重绘
+                                param.args[2] = rebuilt;
+                                if (!mediaCardHookDone) {
+                                    mediaCardHookDone = true;
+                                    XposedBridge.log("[" + TAG + "] 播控栏已安全注入 MediaStyle(保留原RemoteViews): ch=" + ch);
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log("[" + TAG + "] MediaCard 注入失败(保持原通知): " + t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] NotificationManager.notify hook 失败: " + t);
+        }
+    }
+
+    /**
+     * v1.9.43：消除番茄灵动岛「空壳黑条」，让胶囊显示书名/作者/封面。
+     *
+     * 根因（反编译 SystemUI + SurfaceFlinger/像素实测，2026-11-20）：
+     *   番茄 MediaSession 一 active，Motorola SystemUI 就通过
+     *   LiveContentInteractor.requestAttachMedia(true) 把 MediaHost.hostView 挂进
+     *   LiveContentPeek 胶囊（SurfaceFlinger 里该图层 alpha=1 真在渲染）；
+     *   但胶囊的内容槽只读通知里的 motorola.livecontent.* 字段，番茄通知没提供
+     *   → ImageView/TextView 全空 → 露出 LiveContentContainerView 的深色默认背景
+     *   (normalColorRes=0x01060B3D，深色模式下即纯黑) → 视觉上一条纯黑胶囊。
+     *
+     * 做法（只改番茄自身通知，绝不注入 SystemUI / 不影响其他 app）：
+     *   ① hook MediaSession.setMetadata 缓存最新书名/作者/封面；
+     *   ② hook NotificationManager.notify，对 audio_notify_channel* 通知补 4 个 extras。
+     * 全程 try-catch，任何异常都保持原通知不变，绝不影响播放。
+     */
+    // ================================================================================
+    // v1.9.49：SystemUI 侧 —— 只拦番茄的媒体灵动岛浮层
+    // ================================================================================
+    /**
+     * 挂在 SystemUI 进程：拦掉「番茄」那一次媒体浮层挂载。
+     *
+     * 反编译依据（SystemUI 6.8 / classes3.dex，2026-11-20 实测）：
+     *   LiveContentInteractor.requestAttachMedia(Z)V  —— 全逻辑就两条：
+     *     repository._mediaLiveContent.setValue(z ? liveContentMediaHost.hostView : null)
+     *   也就是说：z=true → 把媒体卡片挂进浮层壳子；我们把它改成 false，壳子就不会出现在顶部。
+     *   （壳子本身用 normalColorRes=0x01060B3D，内容为空时就是那条纯黑条。）
+     *
+     * 只对「当前正在播放的媒体会话属于 com.xs.fm」时拦截，其他 App 一律放行。
+     */
+    private void hookSystemUiLiveContentForFanqie(ClassLoader cl) {
+        try {
+            Class<?> it = XposedHelpers.findClass(
+                    "com.motorola.systemui.notification.livecontent.domain.interactor.LiveContentInteractor",
+                    cl);
+            XposedHelpers.findAndHookMethod(it, "requestAttachMedia", boolean.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        boolean want = Boolean.TRUE.equals(param.args[0]);
+                        boolean isXf = isFanqieMediaActive();
+                        if (sysuiTraceCount < 20) {
+                            sysuiTraceCount++;
+                            XposedBridge.log("[" + TAG + "] SystemUI轨迹: requestAttachMedia("
+                                    + want + ") 番茄媒体=" + isXf);
+                        }
+                        if (!want) return;                                 // 只处理「挂载」这次
+                        if (!isXf) return;                                 // 其他 App 放行
+                        param.args[0] = false;
+                        if (!sysuiPeekBlockedLogged) {
+                            sysuiPeekBlockedLogged = true;
+                            XposedBridge.log("[" + TAG + "] 已拦掉番茄的媒体灵动岛浮层（其他 App 不受影响）");
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log("[" + TAG + "] 拦截媒体浮层异常(放行): " + t);
+                    }
+                }
+            });
+            XposedBridge.log("[" + TAG + "] SystemUI: requestAttachMedia hook 已装(番茄专属)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] SystemUI hook 安装失败(不影响系统): " + t);
+        }
+
+        // ★ 真正见效的一刀：番茄在播时，让浮层容器「不画深色背景」。
+        //   LiveContentContainerView.getNeedBackground()Z 只有 1 条指令（return 字段），
+        //   updateBackground() 靠它决定是否铺 normalColorRes(=0x01060B3D，深色模式下就是纯黑)。
+        //   内容永远填不进去（框架丢弃第三方 motorola.* extras），那就干脆别铺那层黑底 ——
+        //   胶囊壳透明，视觉上黑条消失；布局/交互/其他 App 一律照旧。
+        try {
+            Class<?> cv = XposedHelpers.findClass(
+                    "com.motorola.systemui.notification.livecontent.ui.view.LiveContentContainerView", cl);
+            XposedHelpers.findAndHookMethod(cv, "getNeedBackground", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        if (!Boolean.TRUE.equals(param.getResult())) return;
+                        if (!isFanqieMediaActive()) return;
+                        param.setResult(Boolean.FALSE);
+                        if (!sysuiPeekBlockedLogged) {
+                            sysuiPeekBlockedLogged = true;
+                            XposedBridge.log("[" + TAG + "] 已抑制番茄浮层的黑底（胶囊壳透明，其他 App 不受影响）");
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log("[" + TAG + "] 抑制黑底异常(放行): " + t);
+                    }
+                }
+            });
+            XposedBridge.log("[" + TAG + "] SystemUI: getNeedBackground hook 已装(去黑底)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] getNeedBackground hook 失败: " + t);
+        }
+
+        // 诊断：把几条可能的挂载/清除路径都打上轨迹，确认到底是哪条在给番茄挂浮层。
+        hookSysUiTrace(cl, "com.motorola.systemui.notification.livecontent.repository.LiveContentViewRepository",
+                new String[]{"showPeekLiveContent", "hideMediaLiveContent", "clearLiveContent",
+                        "scheduleHidePeekLiveContent", "scheduleHideMediaLiveContent"});
+    }
+
+    /** 在指定类的若干无参方法上打轨迹日志（只记录，不改变行为）。 */
+    private void hookSysUiTrace(ClassLoader cl, String cls, String[] methods) {
+        for (final String m : methods) {
+            try {
+                Class<?> c = XposedHelpers.findClass(cls, cl);
+                XposedHelpers.findAndHookMethod(c, m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            if (sysuiTraceCount < 20) {
+                                sysuiTraceCount++;
+                                XposedBridge.log("[" + TAG + "] SystemUI轨迹: " + m
+                                        + " 番茄播放中=" + isFanqieMediaActive());
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                });
+            } catch (Throwable t) {
+                XposedBridge.log("[" + TAG + "] 轨迹hook失败 " + m + ": " + t);
+            }
+        }
+    }
+
+    /** 当前媒体会话是不是番茄。取不到就返回 false（放行，宁可不拦也不误伤）。 */
+    private boolean isFanqieMediaActive() {
+        android.content.Context ctx = appContext();
+        if (ctx == null) return false;
+        try {
+            android.media.session.MediaSessionManager msm =
+                    (android.media.session.MediaSessionManager)
+                            ctx.getSystemService(android.content.Context.MEDIA_SESSION_SERVICE);
+            if (msm == null) return false;
+            java.util.List<android.media.session.MediaController> list = msm.getActiveSessions(null);
+            if (list == null || list.isEmpty()) return false;
+            // ① 有「正在播放」的会话 → 以它为准（这才是会在浮层里显示的那个）
+            for (android.media.session.MediaController mc : list) {
+                if (mc == null) continue;
+                android.media.session.PlaybackState ps = mc.getPlaybackState();
+                if (ps != null && ps.getState() == android.media.session.PlaybackState.STATE_PLAYING) {
+                    return "com.xs.fm".equals(mc.getPackageName());
+                }
+            }
+            // ② 没有正在播放的：番茄常常是「暂停态也先挂浮层」，看最近活跃（列表第一个）
+            android.media.session.MediaController first = list.get(0);
+            return first != null && "com.xs.fm".equals(first.getPackageName());
+        } catch (Throwable t) {
+            if (!sysuiSessionErrLogged) {
+                sysuiSessionErrLogged = true;
+                XposedBridge.log("[" + TAG + "] 取活动媒体会话失败(默认放行): " + t);
+            }
+        }
+        return false;
+    }
+
+    private void hookLiveContentPeekData() {
+        // ① 缓存最新 MediaMetadata
+        try {
+            Class<?> msCls = XposedHelpers.findClass("android.media.session.MediaSession", null);
+            XposedHelpers.findAndHookMethod(msCls, "setMetadata",
+                    android.media.MediaMetadata.class, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args != null && param.args.length > 0 && param.args[0] != null) {
+                                    liveContentMetadata = param.args[0];
+                                }
+                                // v1.9.47：顺手缓存 MediaSession token —— SystemUI 的媒体灵动岛
+                                // 只认带 android.mediaSession token 的通知，番茄恰好没带。
+                                if (liveContentSessionToken == null && param.thisObject != null) {
+                                    Object tok = android.media.session.MediaSession.class
+                                            .getMethod("getSessionToken").invoke(param.thisObject);
+                                    if (tok instanceof android.media.session.MediaSession.Token) {
+                                        liveContentSessionToken = tok;
+                                        XposedBridge.log("[" + TAG + "] 已缓存 MediaSession token");
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            XposedBridge.log("[" + TAG + "] setMetadata hook 已装(Peek数据源)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] setMetadata hook 失败: " + t);
+        }
+
+        // ②-a 主入口：Service.startForeground(int, Notification) —— 番茄播控通知的真实出口。
+        //     Service.startForeground 是 final 方法，直接经 ActivityManager.setServiceForeground()
+        //     binder 下发，全程不碰 NotificationManager.notify（这就是 v1.9.43 没反应的原因）。
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Service", null, "startForeground",
+                    int.class, Notification.class, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                fillLiveContentExtras((Notification) param.args[1], "startForeground2");
+                            } catch (Throwable t) {
+                                XposedBridge.log("[" + TAG + "] Peek补数据失败(保持原通知): " + t);
+                            }
+                        }
+                    });
+            XposedBridge.log("[" + TAG + "] startForeground(2参) hook 已装(Peek补数据·主通道)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] startForeground hook 失败: " + t);
+        }
+
+        // ②-b Service.startForeground(int, Notification, int) —— 带 foregroundServiceType 的重载
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Service", null, "startForeground",
+                    int.class, Notification.class, int.class, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                fillLiveContentExtras((Notification) param.args[1], "startForeground3");
+                            } catch (Throwable t) {
+                                XposedBridge.log("[" + TAG + "] Peek补数据失败(保持原通知): " + t);
+                            }
+                        }
+                    });
+            XposedBridge.log("[" + TAG + "] startForeground(3参) hook 已装(Peek补数据)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] startForeground(3参) hook 失败: " + t);
+        }
+
+        // ②-c 兜底：普通 notify 通道（部分版本/场景走这条）
+        try {
+            XposedHelpers.findAndHookMethod(android.app.NotificationManager.class, "notify",
+                    String.class, int.class, Notification.class, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                fillLiveContentExtras((Notification) param.args[2], "notify");
+                            } catch (Throwable t) {
+                                XposedBridge.log("[" + TAG + "] Peek补数据失败(保持原通知): " + t);
+                            }
+                        }
+                    });
+            XposedBridge.log("[" + TAG + "] notify hook 已装(Peek补数据·兜底)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] notify hook(Peek) 失败: " + t);
+        }
+
+        // ②-d 再兜一层：Notification.Builder.build() —— 不管最终用哪个 API 投递，
+        //     把 extras 在「造出来那一刻」就写好，避免投递对象与拦截对象不是同一个。
+        try {
+            XposedHelpers.findAndHookMethod(android.app.Notification.Builder.class, "build",
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object r = param.getResult();
+                                if (r instanceof Notification) {
+                                    fillLiveContentExtras((Notification) r, "builder.build");
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log("[" + TAG + "] Peek补数据失败(builder): " + t);
+                            }
+                        }
+                    });
+            XposedBridge.log("[" + TAG + "] Notification.Builder.build hook 已装(Peek补数据·最上游)");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] Notification.Builder.build hook 失败: " + t);
+        }
+    }
+
+    /**
+     * 给番茄播控通知补 Motorola Live Content Peek 字段。
+     * 元数据来源（按可靠性递降，逐个尝试）：
+     *   ① 缓存的 MediaMetadata（hook setMetadata）
+     *   ② 通知里的 EXTRA_MEDIA_SESSION token → MediaController.getMetadata()（实测番茄这条最准）
+     *   ③ 通知自带 EXTRA_TITLE/EXTRA_TEXT/tickerText
+     *   ④ 自定义 RemoteViews 里的文字（最兜底，番茄的通知全用 contentView）
+     * 只处理 audio_notify_channel*，其它渠道原样放行。
+     */
+    private void fillLiveContentExtras(Notification n, String via) {
+        if (n == null) return;
+        String ch = null;
+        try { ch = n.getChannelId(); } catch (Throwable ignored) {}
+        boolean hit = "audio_notify_channel".equals(ch) || "audio_notify_channel_new".equals(ch);
+
+        // 诊断日志：命中渠道与其它渠道各自独立计数，避免互相吃掉名额（v1.9.45 修正）
+        boolean diag = false;
+        if (hit) {
+            if (liveContentDiagCount < 12) { liveContentDiagCount++; diag = true; }
+        } else if (liveContentDiagOther < 3) { liveContentDiagOther++; diag = true; }
+        if (!hit) {
+            if (diag) {
+                XposedBridge.log("[" + TAG + "] Peek诊断·非播控渠道 via=" + via + " channel=" + ch);
+            }
+            return;
+        }
+
+        try {
+            if (n.extras == null) n.extras = new Bundle();
+            // 幂等：已补过就不再动
+            if (n.extras.getBoolean("motorola.notification.liveContentNotification", false)) return;
+
+            String title = null, artist = null, src = "无";
+            android.graphics.drawable.Icon icon = null;
+
+            // ① 缓存的 MediaMetadata
+            Object mdObj = liveContentMetadata;
+            if (mdObj instanceof android.media.MediaMetadata) {
+                android.media.MediaMetadata md = (android.media.MediaMetadata) mdObj;
+                title = textOf(md, android.media.MediaMetadata.METADATA_KEY_TITLE);
+                if (title == null) title = textOf(md, android.media.MediaMetadata.METADATA_KEY_DISPLAY_TITLE);
+                artist = textOf(md, android.media.MediaMetadata.METADATA_KEY_ARTIST);
+                if (artist == null) artist = textOf(md, android.media.MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
+                icon = iconOf(md.getBitmap(android.media.MediaMetadata.METADATA_KEY_ALBUM_ART));
+                if (icon == null) icon = iconOf(md.getBitmap(android.media.MediaMetadata.METADATA_KEY_ART));
+                if (title != null) src = "cache";
+            }
+
+            // ② 通知自带 MediaSession token → 直接问系统要元数据
+            if (title == null) {
+                try {
+                    android.content.Context ctx = appContext();
+                    Object tokObj = n.extras.getParcelable(Notification.EXTRA_MEDIA_SESSION);
+                    if (ctx != null && tokObj instanceof android.media.session.MediaSession.Token) {
+                        android.media.session.MediaController mc = new android.media.session.MediaController(
+                                ctx, (android.media.session.MediaSession.Token) tokObj);
+                        android.media.MediaMetadata md2 = mc.getMetadata();
+                        if (md2 != null) {
+                            title = textOf(md2, android.media.MediaMetadata.METADATA_KEY_TITLE);
+                            if (title == null) title = textOf(md2, android.media.MediaMetadata.METADATA_KEY_DISPLAY_TITLE);
+                            artist = textOf(md2, android.media.MediaMetadata.METADATA_KEY_ARTIST);
+                            if (artist == null) artist = textOf(md2, android.media.MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
+                            icon = iconOf(md2.getBitmap(android.media.MediaMetadata.METADATA_KEY_ALBUM_ART));
+                            if (icon == null) icon = iconOf(md2.getBitmap(android.media.MediaMetadata.METADATA_KEY_ART));
+                            if (title != null) src = "session-token";
+                        }
+                        // 注意：android.media.session.MediaController 没有 release()，
+                        // 用完不持有引用，交给 GC 即可。
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log("[" + TAG + "] Peek取会话元数据失败: " + t);
+                }
+            }
+
+            // ③ 通知自身字段
+            if (title == null) {
+                CharSequence t2 = n.extras.getCharSequence(Notification.EXTRA_TITLE);
+                if (t2 != null && t2.length() > 0) title = t2.toString();
+                else if (n.tickerText != null && n.tickerText.length() > 0) title = n.tickerText.toString();
+                if (title != null) src = "notify-field";
+            }
+            if (artist == null) {
+                CharSequence a2 = n.extras.getCharSequence(Notification.EXTRA_TEXT);
+                if (a2 != null && a2.length() > 0) artist = a2.toString();
+            }
+            if (icon == null) { try { icon = n.getLargeIcon(); } catch (Throwable ignored) {} }
+            if (icon == null) { try { icon = n.getSmallIcon(); } catch (Throwable ignored) {} }
+
+            // ④ 自定义 RemoteViews 里的文字（番茄的通知正文只在这里）
+            if (title == null) {
+                String[] texts = textsFromRemoteViews(n);
+                if (texts != null && texts.length > 0) {
+                    title = texts[0];
+                    if (artist == null && texts.length > 1) artist = texts[1];
+                    src = "remoteviews";
+                }
+            }
+
+            if (title == null && icon == null) {
+                if (diag) {
+                    XposedBridge.log("[" + TAG + "] Peek诊断·无内容可补 via=" + via + " channel=" + ch);
+                }
+                return;   // 真没料就不动，保持原样
+            }
+
+            // v1.9.47 关键补刀：把 MediaSession token 塞进通知。
+            //   SystemUI 的媒体灵动岛（MediaHost 那张卡）只对「带 android.mediaSession token」
+            //   的通知生效；番茄的通知是纯自定义 RemoteViews、没带 token，
+            //   于是 MediaData 为空 → 卡片无内容 → 只剩容器黑底，就是那条黑条。
+            //   这是标准公开键（android.mediaSession），不会被摩托罗拉框架丢弃。
+            boolean tokenAdded = false;
+            Object tok = liveContentSessionToken;
+            if (tok instanceof android.os.Parcelable
+                    && n.extras.getParcelable(Notification.EXTRA_MEDIA_SESSION) == null) {
+                n.extras.putParcelable(Notification.EXTRA_MEDIA_SESSION, (android.os.Parcelable) tok);
+                tokenAdded = true;
+            }
+
+            n.extras.putBoolean("motorola.notification.liveContentNotification", true);
+            // 注意：v1.9.48 试过把 bit0（isMotoLiveContentDisabled）置 1，实测无效 ——
+            //   媒体浮层走的是 MediaHost 挂载，不看这个禁用位（flags=1 已到达系统，黑条照旧）。
+            //   这条禁用位只作用于「通知型」灵动岛，故恢复为清零，交给 SystemUI 侧拦截处理。
+            n.extras.putInt("motorola.notification.flags",
+                    n.extras.getInt("motorola.notification.flags", 0) & ~1);
+            if (title != null) n.extras.putString("motorola.livecontent.peekTitle", title);
+            if (artist != null) n.extras.putString("motorola.livecontent.peekContent", artist);
+            if (icon != null) n.extras.putParcelable("motorola.livecontent.peekIcon", icon);
+            // v1.9.46 取证：同时写标准字段。若系统侧能看到 android.title → 说明改写生效、
+            //   只是 motorola.* 被框架丢弃；若仍是 null → 说明送出去的根本不是这个对象。
+            if (title != null && n.extras.getCharSequence(Notification.EXTRA_TITLE) == null) {
+                n.extras.putString(Notification.EXTRA_TITLE, title);
+            }
+            if (artist != null && n.extras.getCharSequence(Notification.EXTRA_TEXT) == null) {
+                n.extras.putString(Notification.EXTRA_TEXT, artist);
+            }
+
+            if (liveContentIdLog < 6) {
+                liveContentIdLog++;
+                XposedBridge.log("[" + TAG + "] Peek取证 obj=" + System.identityHashCode(n)
+                        + " via=" + via + " channel=" + ch + " 已写keys=" + n.extras.keySet().size());
+            }
+
+            if (!liveContentPeekDone) {
+                liveContentPeekDone = true;
+                XposedBridge.log("[" + TAG + "] 灵动岛Peek已补内容(" + via + "/" + src + "): title=" + title
+                        + " artist=" + artist + " icon=" + (icon != null) + " token=" + tokenAdded);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] Peek补数据异常(保持原通知): " + t);
+        }
+    }
+
+    private static String textOf(android.media.MediaMetadata md, String key) {
+        try {
+            CharSequence cs = md.getText(key);
+            if (cs != null && cs.length() > 0) return cs.toString();
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static android.graphics.drawable.Icon iconOf(android.graphics.Bitmap bmp) {
+        if (bmp == null) return null;
+        try {
+            return android.graphics.drawable.Icon.createWithBitmap(
+                    android.graphics.Bitmap.createScaledBitmap(bmp, 128, 128, true));
+        } catch (Throwable ignored) {
+            try { return android.graphics.drawable.Icon.createWithBitmap(bmp); } catch (Throwable ignored2) {}
+        }
+        return null;
+    }
+
+    private static android.content.Context appContext() {
+        try {
+            return (android.content.Context) Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null);
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 把通知自定义布局里所有非空文字抓出来（按出现顺序，去重）。每个进程最多尝试 3 次。 */
+    private String[] textsFromRemoteViews(Notification n) {
+        if (remoteViewsTried >= 3) return null;
+        remoteViewsTried++;
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        try {
+            android.content.Context ctx = appContext();
+            if (ctx == null) return null;
+            android.widget.RemoteViews rv = n.contentView;
+            if (rv == null) rv = n.bigContentView;
+            if (rv == null) return null;
+            android.view.View v = rv.apply(ctx, null);
+            if (v == null) return null;
+            collectTexts(v, out);
+            XposedBridge.log("[" + TAG + "] Peek诊断·RemoteViews文字=" + out);
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] RemoteViews 取文字失败: " + t);
+        }
+        return out.isEmpty() ? null : out.toArray(new String[0]);
+    }
+
+    private static void collectTexts(android.view.View v, java.util.List<String> out) {
+        if (v == null || out.size() >= 4) return;
+        if (v instanceof android.widget.TextView) {
+            CharSequence cs = ((android.widget.TextView) v).getText();
+            if (cs != null) {
+                String s = cs.toString().trim();
+                if (s.length() > 0 && !out.contains(s)) out.add(s);
+            }
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) collectTexts(g.getChildAt(i), out);
+        }
     }
 
     private void hookDialogBlocker() {
@@ -3821,9 +4625,9 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private void hookListenTimeGate() {
         // ① 全天畅听状态管理器：C() 恒 true（isListenWholeDay）
-        for (String cn : new String[]{
+        for (String cn : expandVariants(new String[]{
                 "com.dragon.read.admodule.adfm.unlocktime.wholeday.u0",
-                "com.dragon.read.admodule.adfm.unlocktime.wholeday.kmp.v2.g0"}) {
+                "com.dragon.read.admodule.adfm.unlocktime.wholeday.kmp.v2.g0"})) {
             try {
                 Class<?> cls = XposedHelpers.findClassIfExists(cn, appCl);
                 if (cls == null) continue;
@@ -3878,13 +4682,13 @@ public class MainHook implements IXposedHookLoadPackage {
         hookListenTimeProviders();
 
         // ③ 特权过期回调：不弹「领取时长」、不暂停正文、不播提示语音
-        for (String cn : new String[]{
+        for (String cn : expandVariants(new String[]{
                 "com.dragon.read.reader.speech.ad.listen.strategy.h",
                 "com.dragon.read.reader.speech.ad.listen.strategy.i",
                 "com.dragon.read.reader.speech.ad.listen.strategy.l",
                 "com.dragon.read.reader.speech.ad.listen.strategy.kmp.v2.h",
                 "com.dragon.read.reader.speech.ad.listen.strategy.kmp.v2.l",
-                "com.dragon.read.reader.speech.ad.listen.strategy.kmp.v2.p"}) {
+                "com.dragon.read.reader.speech.ad.listen.strategy.kmp.v2.p"})) {
             try {
                 Class<?> cls = XposedHelpers.findClassIfExists(cn, appCl);
                 if (cls == null) continue;
@@ -3923,9 +4727,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void hookListenTimeProviders() {
         // ① 剩余时长数据源：ListenTimeManager.f()（普通版 + KMP 版）
-        for (String cn : new String[]{
+        for (String cn : expandVariants(new String[]{
                 "com.dragon.read.admodule.patch.filter.ListenTimeManager",
-                "com.dragon.read.admodule.patch.filter.kmp.v2.ListenTimeManager"}) {
+                "com.dragon.read.admodule.patch.filter.kmp.v2.ListenTimeManager"})) {
             try {
                 Class<?> cls = XposedHelpers.findClassIfExists(cn, appCl);
                 if (cls == null) continue;
@@ -3946,10 +4750,10 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
         // ② AdApi 的几个读取入口（AdImpl 与 KMP 版）
-        for (String cn : new String[]{
+        for (String cn : expandVariants(new String[]{
                 "com.xs.fm.ad.impl.AdImpl",
                 "com.xs.fm.ad.impl.kmp.v2.AdImpl",
-                "com.xs.fm.ad.impl.kmp.v2.k0"}) {
+                "com.xs.fm.ad.impl.kmp.v2.k0"})) {
             Class<?> cls = XposedHelpers.findClassIfExists(cn, appCl);
             if (cls == null) continue;
             for (String mn : new String[]{
@@ -4007,9 +4811,9 @@ public class MainHook implements IXposedHookLoadPackage {
      * 说明：只做"不让路 + TTS 静音"，不动 AudioPlayManager 状态机，避免正常播放被搞挂。
      */
     private void hookAudioAdManager() {
-        for (String cn : new String[]{
+        for (String cn : expandVariants(new String[]{
                 "com.dragon.read.reader.speech.ad.AudioAdManager",
-                "com.dragon.read.reader.speech.ad.kmp.v2.AudioAdManager"}) {
+                "com.dragon.read.reader.speech.ad.kmp.v2.AudioAdManager"})) {
             try {
                 Class<?> cls = XposedHelpers.findClassIfExists(cn, appCl);
                 if (cls == null) continue;
@@ -4298,6 +5102,45 @@ public class MainHook implements IXposedHookLoadPackage {
         return n;
     }
 
+    /**
+     * v1.9.32：听书播放页「智能朗读 / 真人讲书」切换条的内容级保护。
+     *
+     * 6.7.6.32 / 676 的听书页顶栏是一条约 1284x133 的 LinearLayout，里面同时放
+     * 「下拉收起」「智能朗读|真人讲书」「金币福利球」「更多菜单」。广告文本扫描命中
+     * 「福利」后向上爬升找广告卡片容器，会把这条顶栏整体 GONE，切换按钮连带消失。
+     * 旧版靠「顶部 8% 几何保护」拦，但沉浸式状态栏下顶栏 y≈278 > 8%×3168≈253，
+     * 保护静默失效。改为按内容识别，与屏幕尺寸/版本无关。
+     */
+    private static final String[] VOICE_SWITCH_TEXTS = {
+            "智能朗读", "真人讲书", "真人朗读", "智能讲书", "AI朗读"
+    };
+
+    /** 只查 depth 层，避免高频 View 扫描时的全树递归开销。 */
+    private boolean containsVoiceSwitchText(View v, int depth) {
+        if (v == null || depth < 0) return false;
+        try {
+            if (v instanceof TextView) {
+                CharSequence cs = ((TextView) v).getText();
+                if (cs != null) {
+                    String s = cs.toString().trim();
+                    for (String k : VOICE_SWITCH_TEXTS) if (s.contains(k)) return true;
+                }
+            }
+            CharSequence cd = v.getContentDescription();
+            if (cd != null) {
+                String s = cd.toString().trim();
+                for (String k : VOICE_SWITCH_TEXTS) if (s.contains(k)) return true;
+            }
+        } catch (Throwable ignored) {}
+        if (depth > 0 && v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount() && i < 30; i++) {
+                if (containsVoiceSwitchText(vg.getChildAt(i), depth - 1)) return true;
+            }
+        }
+        return false;
+    }
+
     private boolean containsExactText(View v, String s) {
         if (v == null) return false;
         if (v instanceof TextView) {
@@ -4332,6 +5175,8 @@ public class MainHook implements IXposedHookLoadPackage {
     /** 容器级保护：顶部栏/工具栏/标签栏/含主导航的容器绝不可整体隐藏（防止顶部菜单标签被误藏） */
     private boolean isProtectedContainer(View v) {
         if (v == null) return true;
+        // v1.9.32：听书页含「智能朗读/真人讲书」的顶栏整条不可隐藏
+        if (containsVoiceSwitchText(v, 2)) return true;
         String n = v.getClass().getName();
         if (n.contains("AppBar") || n.contains("TopBar") || n.contains("TopView")
                 || n.contains("Toolbar") || n.contains("TabLayout") || n.contains("TitleBar")

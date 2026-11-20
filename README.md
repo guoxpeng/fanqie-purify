@@ -5,8 +5,12 @@
 > 🏠 **项目主页 / 最新版本 / 问题反馈**：[**`guoxpeng/fanqie-purify`**](https://github.com/guoxpeng/fanqie-purify)
 > 📦 **发布镜像**（Vector / LSPosed 管理器读取）：[`Xposed-Modules-Repo/com.eta.fanqie.enhance`](https://github.com/Xposed-Modules-Repo/com.eta.fanqie.enhance)
 
-> **当前版本：v1.9.23** ｜ **适配目标应用：番茄畅听 `6.7.2.32`（versionCode `672`）实测通过**
+> **当前版本：v1.9.52** ｜ **适配目标应用：番茄畅听 `6.8.0.32`（versionCode `680`）实测通过**
 > 框架要求：Root + Vector 或 LSPosed（xposedminversion 82，Android 8.0+）
+
+> ⚠️ **已知现象（不是模块的 BUG）**：番茄畅听播放时，Motorola 机型顶部会出现一条**纯黑胶囊**。
+> 那是系统 UI 的「媒体灵动岛」折叠态，内容槽只接受特权应用写入，第三方 App 填不进去。
+> 详见 [已知问题：顶部黑条](#已知问题顶部黑条motorola-机型)。
 
 > 💡 **v1.9.21 起「我的」页 / 设置项 / 桌面长按广告都改成了「文案 + 结构」的版本无关做法** ——
 > 以后再出小版本通常不用改代码，跑一遍 `bash tools/adapt_new_version.sh` 看结论即可。
@@ -18,22 +22,24 @@
 | 项目 | 值 |
 |------|-----|
 | **适配应用** | 番茄畅听 `com.xs.fm` |
-| **适配版本名** | **`6.7.2.32`** |
-| **适配 versionCode** | **`672`** |
-| 实测设备 | Realme RMX2202 / Android 14 |
+| **适配版本名** | **`6.8.0.32`**（上一版支持 `6.7.2.32` / `6.7.6.32`） |
+| **适配 versionCode** | **`680`** |
+| 实测设备 | Motorola（Android 15）/ Realme RMX2202（Android 14） |
 | 实测框架 | Vector（LSPosed 兼容） |
 
 ### 适配版本历史
 
 | 番茄畅听版本 | versionCode | 对应模块版本 | 状态 | 该版新增的适配要点 |
 |---|---|---|---|---|
-| **`6.7.2.32`** | **`672`** | **v1.9.23** | ✅ **当前版本，实测通过** | 资源 id **没有平移**（13 个名字全部 `old == new`）但**含义变了**（`e4q` 从「我的资产」变成「快捷入口栏」，`br7`/`ej2`/`ce4` 整组消失）；混淆类 `f22.q`→`f32.q`、`a13.d0`→`i23.d0`。**「我的」页 / 设置项 / 桌面长按广告改为版本无关实现**；修掉「我的」页留空白与切 Tab 不刷新；修掉 `ShortcutManager` 类名写错导致长按图标广告栏不住 |
-| `6.7.1.32` | `671` | v1.9.20 | ✅ 实测通过（上一版，不再维护） | versionCode 仍是 671 ⇒ 混淆「名字表」未变，但**资源 id 数值整体平移**，需按新包重新提取；「我的」页换成新 id（`bpz`→`br7`、`e33`→`e4q`、`ccv`→`ce3`/`ce4`）。新增阅读页 OneStop 购物卡 / 章节末广告入口行 / 首页 VIP 促销全屏浮层 / 「我的」页四类入口的拦截 |
-| `6.7.1.16` | `671` | v1.9.10 | ✅ 实测通过（上一版，不再维护） | 16 个混淆类名 / 资源 id 全部复核存在；支持免登录；修复未登录时「我的」页头部消失 |
+| **`6.8.0.32`** | **`680`** | **v1.9.52** | ✅ **当前版本，实测通过** | 赚金币整屏浮层拦截；听书页「购物/金币球」改按父链内容特征定位；章节结束语音广告 + `.aac` 播报源头短路；畅听时长/全天畅听伪装；首页推荐悬浮窗源头拦截。**另附顶部黑条完整排查结论**（见「已知问题」） |
+| `6.7.6.32` | `676` | v1.9.31 | ✅ 实测通过（历史版本） | 新增被动展示位拦截；第一次拿到 View 上下文时按名解析 676 的资源 id（替代硬编码）；听书页含「智能朗读/真人讲书」的顶栏整条不隐藏 |
+| `6.7.2.32` | `672` | v1.9.23 | ✅ 实测通过（历史版本） | 资源 id **没有平移**（13 个名字全部 `old == new`）但**含义变了**（`e4q` 从「我的资产」变成「快捷入口栏」，`br7`/`ej2`/`ce4` 整组消失）；混淆类 `f22.q`→`f32.q`、`a13.d0`→`i23.d0`。**「我的」页 / 设置项 / 桌面长按广告改为版本无关实现**；修掉「我的」页留空白与切 Tab 不刷新；修掉 `ShortcutManager` 类名写错导致长按图标广告栏不住 |
+| `6.7.1.32` | `671` | v1.9.20 | ✅ 实测通过（历史版本） | versionCode 仍是 671 ⇒ 混淆「名字表」未变，但**资源 id 数值整体平移**，需按新包重新提取；「我的」页换成新 id（`bpz`→`br7`、`e33`→`e4q`、`ccv`→`ce3`/`ce4`）。新增阅读页 OneStop 购物卡 / 章节末广告入口行 / 首页 VIP 促销全屏浮层 / 「我的」页四类入口的拦截 |
+| `6.7.1.16` | `671` | v1.9.10 | ✅ 实测通过（历史版本） | 16 个混淆类名 / 资源 id 全部复核存在；支持免登录；修复未登录时「我的」页头部消失 |
 | `6.6.7.32` | `667` | v1.9.4 / v1.9.5 | ✅ 实测通过（历史版本） | DialogFragment 广告弹窗拦截、广告文本实时过滤、听歌页广告按资源 id 精确隐藏 |
-| `6.6.4.32` | `664` | v1.9.2 | ✅ 实测通过（上上版） | 阅读页左上角金币入口隐藏（`h80` 顶部左右角均识别） |
+| `6.6.4.32` | `664` | v1.9.2 | ✅ 实测通过（历史版本） | 阅读页左上角金币入口隐藏（`h80` 顶部左右角均识别） |
 
-> 上表除首行外均为**此前已验证通过的历史版本**，它们在对应模块版本上实测可用，但**已不再维护**；当前只对 `6.7.2.32 (672)` 做适配与验证。
+> 上表除首行外均为**此前已验证通过的历史版本**，它们在对应模块版本上实测可用，但**已不再维护**；当前只对 `6.8.0.32 (680)` 做适配与验证。
 
 **只保证在上述版本上工作。** 番茄的类名与资源 id 随版本强混淆、逐版变动，因此：
 
@@ -133,6 +139,19 @@ bash tools/adapt_new_version.sh --pull-tree --clear-dump   # 把 View 树拉到 
 
 ### 语音广告拦截
 - **「XX金币已到账…」语音播报（v1.9.23）**：听书一段时间后突然冒出的语音广告是字节 **Polaris（增长/激励体系）** 下发的、**下载的 `.aac`**（不是 TTS）。在播放入口源码级短路：`com.bytedance.polaris.impl.voice.w.a|o` + `com.bytedance.polaris.impl.audio.AudioHelper.s|r|j`，且**只短路返回 `void` 的重载**（`boolean`/`String` 这类策略查询一律不碰，不会破坏调用方状态机）
+- **章节结束语音广告（v1.9.24）**：`hookAudioAdManager()` 拦 `AudioAdManager` / TTS 播报链路
+- **`.aac` 数据源兜底（v1.9.25 / v1.9.26）**：语音广告走播放器 URL（`novel-tts` / `warningtone_*.aac`），在 `hookPlayerUrlBlocker()` 里按 URL 特征短路，即使前面几层被绕过也不会出声
+- **修 `speak()` 双签名（v1.9.30）**：两个重载原先塞在同一个 `try` 里，第二个签名永远挂不上，已拆开
+
+### 畅听特权伪装（v1.9.29）
+- `hookListenTimeGate()`：伪装畅听时长 / 全天畅听状态，点听书不再被「时长已用完」拦停
+- 全天畅听计时相关 View 一并处理，避免残留倒计时遮挡
+
+### 运营浮层 / 金币浮层
+- **首页「推荐悬浮窗 / 推荐插屏」（v1.9.24）**：`hookMainRecommendFloat()` 源头拦截（双 11 一类运营浮窗）
+- **赚金币整屏浮层（v1.9.38）**：`hookCoinSheetPages()` 拦截 680 版从下往上占满屏的金币浮层 / 金币任务页
+- **听书页「购物 / 金币球」（v1.9.36 / v1.9.37）**：按 View 自身特征 + 父链内容特征定位，不依赖几何坐标、容器资源名或顶栏可见性
+- **顶栏保护（v1.9.32）**：含「智能朗读 / 真人讲书」的顶栏整条不参与隐藏，避免误伤切换按钮
 
 ### 广告拦截（v1.9.9 增强）
 - **听歌页贴片广告**：番茄的「贴片广告」由字节 Lynx（`com.ss.android.mannor`）模板渲染，装在 `MusicPatchAdContainer` 里，**没有固定资源 id**。模块改为**视觉层面**拦截：hook 该容器构造 + `View.setVisibility`，只置 `GONE`、绝不 `removeView`（`ViewStub` 只能 inflate 一次，remove 会抛异常），彻底消除「小视频 + 商家推荐 + 倒计时」广告卡
@@ -142,6 +161,55 @@ bash tools/adapt_new_version.sh --pull-tree --clear-dump   # 把 View 树拉到 
 - AdUnlockTimeDialogManager 弹窗拦截（源码级 hook）
 - 激励广告 SDK 调用拦截（showAd / preloadAd 等）
 - 广告倒计时 View 创建即 GONE（MusicAdUnlockTimeView / AdUnlockTimeFloatingView）
+
+---
+
+## 已知问题：顶部黑条（Motorola 机型）
+
+**现象**：番茄畅听播放时，屏幕顶部（状态栏位置）出现一条**纯黑、无内容**的胶囊；点它会放大成播放面板；暂停/退出番茄后消失。
+
+**结论：这不是模块的 BUG，也不是番茄画的。** 它是 Motorola 系统 UI 的「媒体灵动岛」折叠态 `LiveContentPeek`。
+
+| 观测项 | 实测结果 |
+|---|---|
+| 像素测量 | 黑条 x65–1374 / y30–139，纯黑（RGB < 40），与 `LiveContentPeek` 窗口 frame `72,18–1368,142` 完全吻合 |
+| SurfaceFlinger | `LiveContentPeek#4138 flags:0 a:1`，alpha=1 **确实在渲染**（`dumpsys window` 里的 `isVisible=false` 是假象） |
+| 归属 | 番茄进程在 → 有；`force-stop com.xs.fm` → 立刻消失；YouTube 无媒体通知 → 从不出现 |
+| 内容来源 | 只读通知 extras 的 `motorola.livecontent.peekTitle / peekContent / peekIcon` |
+| 第三方能否写 | **不能**。同一份通知里 `android.title / android.text` 完整到达系统，`motorola.*` 被框架整体丢弃 |
+| 为什么是纯黑 | 内容全空 → 露出 `LiveContentContainerView` 的深色默认背景 `normalColorRes=0x01060B3D`（深色模式下即纯黑） |
+
+**可选的三种处理方式**：
+
+| 方案 | 效果 | 代价 / 风险 |
+|---|---|---|
+| **A. 不管它**（默认） | 点击黑条能正常展开播放面板，功能不受影响 | 视觉上难看 |
+| **B. 全局关闭媒体胶囊**（已验证，推荐给"就是不想看到它"的人） | 黑条立刻消失 | 所有 App 的媒体胶囊都不显示（通知类灵动岛：计时器/导航/外卖不受影响），一条命令可回滚 |
+| **C. SystemUI 侧只拦番茄**（v1.9.52 起的实验代码） | 理论上只影响番茄 | **未完成验证**，需手动加 SystemUI 作用域，不推荐普通用户 |
+
+方案 B 的命令（需 root）：
+
+```bash
+# 关闭
+su -c 'content insert --uri content://com.motorola.android.providers.settings/secure \
+  --bind name:s:live_content_type_disabled --bind value:s:media'
+# 回滚
+su -c 'content delete --uri content://com.motorola.android.providers.settings/secure \
+  --where "name=\"live_content_type_disabled\""'
+```
+
+> 注意：写在标准 `settings put secure` 里**无效**，SystemUI 只读摩托罗拉自家的 `com.motorola.android.providers.settings`。
+
+方案 C 的启用方式（需自行承担风险）：
+
+```bash
+su -c '/data/adb/lspd/cli scope add com.eta.fanqie.enhance com.android.systemui/0'
+su -c 'killall com.android.systemui'          # 重启 SystemUI 让钩子加载
+# 撤销
+su -c '/data/adb/lspd/cli scope rm com.eta.fanqie.enhance com.android.systemui/0'
+```
+
+完整排查过程（反编译证据、走过的死路）见 [`RELEASE_NOTES_v1.9.52.md`](RELEASE_NOTES_v1.9.52.md)。
 
 ---
 
@@ -169,7 +237,7 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 - **做法**：编译 → d8 出 `classes.dex` → 替换进**上一版已签名 APK**（保留其资源与清单，省掉 aapt2 重打包）→ 就地补丁二进制清单里的 `versionCode`/`versionName` → 用**同一个 keystore** 重新做 v1+v2 签名，所以能直接 `adb install -r` 覆盖安装
 - **可覆盖的环境变量**：`ANDROID_JAR` / `R8_JAR` / `APKSIG_JAR` / `BCPROV_JAR` / `BCPKIX_JAR` / `TEMPLATE_APK`（上一版模块 APK，须与本机安装的是同一签名）/ `KEYSTORE` / `WORK`
 - 仓库里附带的 `fanqie-enhance-*.apk` 既是成品，也是下一次构建的 `TEMPLATE_APK`
-- **模板按版本号取最大的那个**：当前是 `fanqie-enhance-v1.9.23.apk` —— 开发机实测通过的那一版，作为**产物基准**
+- **模板按版本号取最大的那个**：当前是 `fanqie-enhance-v1.9.52.apk` —— 开发机实测通过的那一版，作为**产物基准**
 - ⚠️ **本地产物与 CI 产物不一定是同一个二进制**：`--lib android.jar` 不同 —— 本地默认用 Gradle 缓存里那个**裁剪版**（不含 `java.lang.*` 桩），CI 用官方 platform-34 的**完整版**。d8 因此做出等价的编码选择差异（`filled-new-array` vs `new-array` + `aput-object`、`invokeinterface CharSequence.toString()` vs `invokevirtual Object.toString()`），dex 会差几百字节。两者**功能完全等价**（类 / 方法 / 字符串 / 字段完全相同，只差 1 条 method 引用），但 sha256 不同。若要逐字节复现 CI 产物，把 `ANDROID_JAR` 指向官方 platform-34 的 `android.jar`
 - 正因为这个差异，**对外发布的永远是仓库里这份本地构建的模板包**，不是 CI 现场编译的产物（见下文方式三）
 
@@ -210,6 +278,7 @@ bash module/build_local.sh        # 产物：module-local.apk，可直接 adb in
 - **「我的」页的活动横幅 `ej2` 是轮换位**：屏蔽是按容器 id 做的，所以后续换成别的活动（春节、双十一…）也会一起消失；若只想屏蔽某一档活动，需要改成按内容/跳转目标过滤
 - 正文流的 OneStop 广告卡被短路后，阅读器不再为它预留位置 —— 这是有意为之（避免留白），但如果将来官方把有用内容放进同一容器，也会一起不显示
 - 模块只影响 `com.xs.fm` 主进程，不影响其他应用
+- **SystemUI 侧代码（v1.9.49+）默认不激活**：模块作用域仍只有 `com.xs.fm`；只有手动 `scope add com.android.systemui` 才会进系统进程，且该实验尚未完成验证（见「已知问题：顶部黑条」）
 - 若重装模块后不生效，在管理器里把模块开关关掉再打开一次即可
 
 ---

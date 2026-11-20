@@ -90,6 +90,58 @@ Lynx 广告场景 / silk subwindow / 音乐贴片广告 / 全天畅听特权伪�
 - 本次未改动其它已有拦截逻辑；`p1.f` 只短路上述 4 类文案性推广消息，其它 MessageType 原样放行。
 - 构建：沿用「替换模板 APK 里的 classes.dex + 重新签名」的本地构建链路，产物 `fanqie-enhance-v1.9.24.apk`。
 
+## [v1.9.52] - 2026-11-20
+
+> 本版把 v1.9.31 → v1.9.52 的积累一次收口。**主功能仍是广告/营销净化**；
+> v1.9.39 起新增的「灵动岛黑条」相关代码全部是排查副产物，**其中 SystemUI 侧钩子默认不激活**
+> （需要手动给模块添加 `com.android.systemui` 作用域才会生效），见文末说明。
+> v1.9.24 – v1.9.30 的变更见下方各自条目。
+
+### 新增（v1.9.31 – v1.9.38）
+- **赚金币浮层**：`hookCoinSheetPages()` —— 拦截 680 版从下往上占满屏的赚金币浮层 / 金币任务页（v1.9.38）
+- **6.7.6.32（676）/ 6.8.0.32（680）适配**：新增被动展示位拦截；听书页「购物/金币球」按父链内容特征
+  定位（不依赖几何坐标与资源 id）；听书页含「智能朗读 / 真人讲书」的顶栏整条一律不隐藏（v1.9.31 / v1.9.32 / v1.9.36 / v1.9.37）
+- **资源 id 改为按名解析**：去掉硬编码 id 表，第一次拿到 View 上下文时按资源名解析（换包不再整表平移）
+
+### 移除 / 回滚（重要，避免后人重踩）
+- **v1.9.38 的「给播控通知注入 MediaStyle」已彻底移除**：注入会额外造出一个空壳媒体通知，
+  反而多出一条黑条；v1.9.39 关闭、v1.9.40 试过「安全克隆再注入」也被实测证伪，代码里保留
+  `false` 开关并注明「永不再开」。
+- **v1.9.42 移除灵动岛 opt-out**：干净 A/B（模块 0 条 hook 日志）下黑条像素宽度与装模块时**完全相同**，
+  证明黑条不是模块造出来的。
+
+### 排查结论：番茄播放时顶部那条黑条是什么（v1.9.43 – v1.9.52）
+结论先行：**它是 Motorola 系统 UI 的「媒体灵动岛」折叠态（`LiveContentPeek`）**，
+不是模块画的，也不属于番茄。
+
+| 观测 | 结果 |
+|---|---|
+| 像素测量 | 黑条 x65–1374 / y30–139，纯黑（RGB < 40），与 `LiveContentPeek` 窗口 frame `72,18–1368,142` 吻合 |
+| SurfaceFlinger | `LiveContentPeek#4138 flags:0 a:1` —— alpha=1，**确实在渲染**；`dumpsys window` 里的 `isVisible=false` 是假象 |
+| 归属验证 | 番茄进程在 → 有；`am force-stop com.xs.fm` → 立刻消失；YouTube 无媒体通知 → 从不出现 |
+| 内容槽 | Peek 只读通知 extras 的 `motorola.livecontent.peekTitle / peekContent / peekIcon` |
+| 第三方能否写 | **不能**。同一份通知里我们写的 `android.title / android.text` 完整到达系统，`motorola.*` 被框架整体丢弃（`motorola.notification.flags` 反而保留） |
+| 空内容的后果 | 文字/图标全空 → 露出 `LiveContentContainerView` 的深色默认背景 `normalColorRes=0x01060B3D`（深色模式即纯黑） |
+
+由此得出：**对第三方音频 App，这一层永远是「有壳无内容」= 黑条**，在应用侧补内容这条路是死路
+（v1.9.43–v1.9.48 陆续试过 `notify` / `startForeground` / 标准字段 / 会话 token / flags bit0，全部无效；
+其中会话 token 注入让**下拉通知栏的媒体卡片**恢复正常显示，这一项保留）。
+
+### 实验性（默认不激活）：SystemUI 侧只拦番茄
+- `hookSystemUiLiveContentForFanqie()` 挂两个点（v1.9.49 – v1.9.52）：
+  1. `LiveContentInteractor.requestAttachMedia(Z)` —— 番茄正在播放时把 `true` 改 `false`，不挂载浮层；
+  2. `LiveContentContainerView.getNeedBackground()` —— 番茄正在播放时返回 `false`，不铺深色底。
+  两条都只在「活动媒体会话的包名 = `com.xs.fm` 且状态为 PLAYING」时动手，其他 App 一律放行。
+- **默认不生效**：模块 `xposedscope` 仍只有 `com.xs.fm`。要让上述代码生效，需手动执行
+  `su -c '/data/adb/lspd/cli scope add com.eta.fanqie.enhance com.android.systemui/0'` 再重启 SystemUI。
+- ⚠️ **状态：未完成验证**。实测 `requestAttachMedia` 在番茄播放时并未被调到（另有挂载路径），
+  `getNeedBackground` 抑制方案在收尾时被打断、未取得最终画面证据。因此**不推荐普通用户启用**。
+
+### 验证过的替代方案（不动模块）
+- 系统设置层全局关闭媒体胶囊：向 Motorola 私有设置库写
+  `live_content_type_disabled=media`（需 root，`content insert --uri content://com.motorola.android.providers.settings/secure`），
+  黑条立刻消失；代价是**所有 App 的媒体胶囊都不显示**，通知类灵动岛（计时器/导航/外卖）不受影响。可随时 `content delete` 回滚。
+
 ## [v1.9.23] - 2026-10-05
 
 ### 新增（用户反馈：听一段时间会冒出「XX金币已到账…」语音广告）
